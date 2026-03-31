@@ -4,10 +4,11 @@ import { useState, useEffect, useCallback } from 'react';
 import { Header } from '@/components/header';
 import { StatsCard } from '@/components/stats-card';
 import { BotCard } from '@/components/bot-card';
-import { RegimeCard, PnlCard, ActivePositionsCard, SignalSummaryTable } from '@/components/dashboard/command-center';
+import { SegmentPerformancePanel } from '@/components/segment-performance-panel';
+import { RegimeCard, PaperTradesCard, LiveTradesCard, ActivePositionsCard, BrainExecutionSummary } from '@/components/dashboard/command-center';
 
 import { AthenaPanel } from '@/components/dashboard/athena-panel';
-
+import { MarketStructurePanel } from '@/components/dashboard/market-structure';
 import { SegmentHeatmap } from '@/components/dashboard/segment-heatmap';
 import { Bot, TrendingUp, Activity, DollarSign, Zap } from 'lucide-react';
 import Link from 'next/link';
@@ -32,6 +33,7 @@ interface DashboardClientProps {
   };
   bots: any[];
   recentTrades: any[];
+  segmentPerf?: any[];
 }
 
 interface BotState {
@@ -45,6 +47,11 @@ interface BotState {
     coin_states: Record<string, any>;
     cycle: number;
     timestamp: string | null;
+    last_analysis_time?: string | null;
+    next_analysis_time?: string | null;
+    veto_log?: any[];
+    pending_signals_count?: number;
+    pending_signals_detail?: { symbol: string; queue_reason: string; cycles_pending: number; conviction: number; side: string; expires_in_sec: number }[];
   };
   tradebook: { trades: any[]; summary: any };
   engine?: {
@@ -77,7 +84,7 @@ interface BotState {
   }>;
 }
 
-export function DashboardClient({ user, stats, bots, recentTrades }: DashboardClientProps) {
+export function DashboardClient({ user, stats, bots, recentTrades, segmentPerf = [] }: DashboardClientProps) {
   const [mounted, setMounted] = useState(false);
   const [botState, setBotState] = useState<BotState | null>(null);
   const [lastRefresh, setLastRefresh] = useState('');
@@ -86,6 +93,7 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
   const [pnlScope, setPnlScope] = useState<'session' | 'all'>('all');
   const [walletBalance, setWalletBalance] = useState<{ binance: number | null; coindcx: number | null }>({ binance: null, coindcx: null });
   const [livePrices, setLivePrices] = useState<Record<string, number>>({});
+  const [nextScanSecs, setNextScanSecs] = useState<number | null>(null);
 
   const fetchBotState = useCallback(async () => {
     try {
@@ -102,6 +110,31 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
       setIsRefreshing(false);
     }
   }, []);
+
+  // ─── Cycle-aware countdown & smart refresh ────────────────────────────────
+  // Ticks every second. When the engine's next_analysis_time passes (countdown
+  // crosses 0), immediately fetch fresh bot state — no waiting for the 15s poll.
+  useEffect(() => {
+    let alreadyTriggered = false; // prevent double-fire in the same countdown window
+    const tick = () => {
+      const nextTs = botState?.multi?.next_analysis_time;
+      if (!nextTs) { setNextScanSecs(null); return; }
+      const remaining = Math.ceil((new Date(nextTs).getTime() - Date.now()) / 1000);
+      setNextScanSecs(remaining);
+
+      // 💡 Sync point: fire immediately when cycle is due
+      if (remaining <= 0 && !alreadyTriggered) {
+        alreadyTriggered = true;
+        // Short delay to give engine time to write state, then fetch
+        setTimeout(() => fetchBotState(), 2500);
+      }
+      // Reset trigger when a new countdown starts (engine posted next_analysis_time)
+      if (remaining > 5) alreadyTriggered = false;
+    };
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, [botState?.multi?.next_analysis_time, fetchBotState]);
 
   useEffect(() => {
     setMounted(true);
@@ -198,13 +231,8 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ botId, isActive: !currentStatus }),
       });
-
-      if (response.ok) {
-        window.location.reload();
-      }
-    } catch (error) {
-      console.error('Error toggling bot:', error);
-    }
+      if (response.ok) window.location.reload();
+    } catch (error) { console.error('Error toggling bot:', error); }
   };
 
   const handleDeleteBot = async (botId: string) => {
@@ -218,6 +246,18 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
     } catch (error) { console.error('Error deleting bot:', error); }
   };
 
+  const handleRetireBot = async (botId: string) => {
+    try {
+      const res = await fetch('/api/bots/retire', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ botId }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok) window.location.reload();
+      else alert(d.error || 'Failed to retire bot.');
+    } catch { alert('Failed to retire bot. Please try again.'); }
+  };
+
   if (!mounted) {
     return null;
   }
@@ -225,8 +265,37 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
   const formatCurrency = (value: number) => `$${value.toFixed(2)}`;
 
   const multi = botState?.multi;
-  // Prefer live trades from bot-state API; fall back to SSR Prisma trades
+  // Prefer Prisma-synced trades; fallback to raw engine trades; final fallback to SSR
   const apiTrades = botState?.tradebook?.trades || [];
+  const rawEngineActiveTrades = ((botState as any)?.tradebook?.rawTrades || []).map((t: any) => ({
+    // Normalize raw engine trade format to match getUserTrades output
+    id: `engine_${t.trade_id || t.id}`,
+    trade_id: t.trade_id || t.id,
+    symbol: t.symbol || t.coin || '',
+    coin: (t.symbol || t.coin || '').replace('USDT', ''),
+    side: (t.side || '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+    position: (t.side || '').toLowerCase() === 'sell' ? 'short' : 'long',
+    regime: t.regime || '',
+    confidence: t.confidence || 0,
+    mode: t.mode || 'paper',
+    leverage: t.leverage || 1,
+    capital: t.capital || 100,
+    entry_price: t.entry_price || t.entryPrice || 0,
+    current_price: t.current_price || t.currentPrice || null,
+    exit_price: t.exit_price || t.exitPrice || null,
+    stop_loss: t.stop_loss || t.stopLoss || 0,
+    take_profit: t.take_profit || t.takeProfit || 0,
+    status: 'ACTIVE',
+    unrealized_pnl: t.unrealized_pnl || 0,
+    unrealized_pnl_pct: t.unrealized_pnl_pct || 0,
+    pnl: 0,
+    entry_time: t.entry_timestamp || t.entry_time || new Date().toISOString(),
+    exit_time: null,
+    bot_name: t.bot_name || 'Synaptic',
+    bot_id: t.bot_id || '',
+    // source tag to distinguish from Prisma trades
+    _source: 'engine_raw',
+  }));
   const ssrTradesNormalized = (recentTrades || []).map((t: any) => ({
     ...t,
     symbol: t.coin || t.symbol || '',
@@ -242,7 +311,12 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
     bot_name: 'Synaptic Adaptive',
     mode: t.mode || 'paper',
   }));
-  const trades = apiTrades.length > 0 ? apiTrades : ssrTradesNormalized;
+  // Priority: Prisma trades → raw engine trades → SSR trades
+  const trades = apiTrades.length > 0
+    ? apiTrades
+    : rawEngineActiveTrades.length > 0
+      ? rawEngineActiveTrades
+      : ssrTradesNormalized;
 
   // Extract BTC multi-timeframe data for regime card — prefer coin_states over stale state
   const btcState = multi?.coin_states?.['BTCUSDT'] || {};
@@ -372,7 +446,7 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
 
   const liveStats = {
     activeBots: stats?.activeBots ?? (bots?.filter((b: any) => b?.isActive)?.length ?? 0),
-    activeTrades: liveActiveTrades.length || stats?.activeTrades || 0,
+    activeTrades: bots.length === 0 ? 0 : (liveActiveTrades.length || stats?.activeTrades || 0),
     totalPnl: paperTotalPnl + liveTotalModePnl, // from tradebook, not recalculated
     paperTotalPnl,
     paperPnlPct,
@@ -385,6 +459,17 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
     paperMaxCapital,
     liveMaxCapital,
   };
+
+  // Per-mode stat breakdowns for the new cards
+  const paperBots = bots.filter((b: any) => !(b?.config?.mode || 'paper').toLowerCase().includes('live')).filter((b: any) => b?.isActive).length;
+  const liveBots = bots.filter((b: any) => (b?.config?.mode || '').toLowerCase().includes('live')).filter((b: any) => b?.isActive).length;
+  const paperWins = paperClosedTrades.filter((t: any) => (parseFloat(t.realized_pnl) || parseFloat(t.totalPnl) || parseFloat(t.pnl) || 0) > 0).length;
+  const paperLosses = paperClosedTrades.length - paperWins;
+  const liveWins = liveClosedModeTrades.filter((t: any) => (parseFloat(t.realized_pnl) || parseFloat(t.totalPnl) || parseFloat(t.pnl) || 0) > 0).length;
+  const liveLosses = liveClosedModeTrades.length - liveWins;
+  const paperTotalTrades = paperActiveTrades.length + paperClosedTrades.length;
+  const liveTotalTrades = liveModeTrades.length + liveClosedModeTrades.length;
+  const segmentsScanned = botState?.multi?.coins_scanned || 0;
 
   return (
     <div className="min-h-screen">
@@ -400,50 +485,12 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
           >
             <div className="flex items-center justify-between">
               <div>
-                <h1 className="text-3xl font-bold mb-1">
-                  Welcome, <span style={{ color: '#ffffff' }}>{user?.name ?? 'Trader'}</span>
+                <h1 className="text-2xl font-bold mb-1">
+                  Welcome, <span className="text-[var(--color-primary)]">{user?.name ?? 'Trader'}</span>
                 </h1>
-                <p className="text-[var(--color-text-secondary)] text-sm">
+                <p className="text-[var(--color-text-secondary)] text-xs">
                   AI Crypto Trading Cockpit — Monitor your bots and market signals
                 </p>
-              </div>
-              {/* PnL Scope Toggle + Mode Badge — top right */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                {/* LIVE / PAPER badge */}
-                {liveStats.activeBots > 0 && (
-                  <span style={{
-                    padding: '3px 10px', borderRadius: '6px', fontSize: '11px', fontWeight: 700, letterSpacing: '0.5px',
-                    background: activeBotMode === 'live' ? 'rgba(239,68,68,0.15)' : 'rgba(6,182,212,0.1)',
-                    color: activeBotMode === 'live' ? '#EF4444' : '#06B6D4',
-                    border: `1px solid ${activeBotMode === 'live' ? 'rgba(239,68,68,0.3)' : 'rgba(6,182,212,0.2)'}`,
-                  }}>
-                    {activeBotMode === 'live' ? '⬤ LIVE' : 'PAPER'}
-                  </span>
-                )}
-                <span style={{ fontSize: '11px', color: '#6B7280', fontWeight: 500 }}>PnL Scope:</span>
-                <div style={{
-                  display: 'inline-flex', borderRadius: '8px', overflow: 'hidden',
-                  border: '1px solid rgba(6,182,212,0.2)', background: 'rgba(17,24,39,0.6)',
-                }}>
-                  {(['session', 'all'] as const).map((scope) => (
-                    <button
-                      key={scope}
-                      onClick={() => setPnlScope(scope)}
-                      style={{
-                        padding: '4px 12px', fontSize: '11px', fontWeight: 600,
-                        border: 'none', cursor: 'pointer', transition: 'all 0.15s',
-                        background: pnlScope === scope ? 'rgba(6,182,212,0.2)' : 'transparent',
-                        color: pnlScope === scope ? '#06B6D4' : '#6B7280',
-                        borderRight: scope === 'session' ? '1px solid rgba(6,182,212,0.15)' : 'none',
-                      }}
-                    >
-                      {scope === 'session' ? 'This Session' : 'All Time'}
-                    </button>
-                  ))}
-                </div>
-                {pnlScope === 'session' && !currentSessionId && (
-                  <span style={{ fontSize: '10px', color: '#F59E0B' }}>No active session</span>
-                )}
               </div>
             </div>
           </motion.div>
@@ -457,21 +504,19 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
           >
             <div style={{
               display: 'grid',
-              gridTemplateColumns: '1.4fr 0.5fr 1.4fr',
+              gridTemplateColumns: '1fr 0.5fr 1fr',
               gap: '20px',
             }}>
-              <RegimeCard
-                regime={regime}
-                confidence={confidence}
-                symbol={symbol}
-                macroRegime={macroRegime}
-                trend15m={trend15m}
-                coinStates={multi?.coin_states}
-                macro={{
-                  btc_action: multi?.coin_states?.BTCUSDT?.deploy_status || 'WAITING',
-                  btc_regime_name: multi?.coin_states?.BTCUSDT?.regime || regime,
-                  confidence: multi?.coin_states?.BTCUSDT?.confidence || 0,
-                }}
+              {/* Paper Trades Card (left) */}
+              <PaperTradesCard
+                activeTrades={paperActiveTrades.length}
+                activeBots={paperBots}
+                pnl={liveStats.paperTotalPnl}
+                pnlPct={liveStats.paperPnlPct}
+                deployedCapital={liveStats.paperCapitalDeployed}
+                totalTrades={paperTotalTrades}
+                wins={paperWins}
+                losses={paperLosses}
               />
 
               {/* ═══ Synaptic Core Brain — Engine Status ═══ */}
@@ -577,61 +622,105 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
                         </line>
                       ))}
                     </svg>
+
+                    {/* ── Next Scan Countdown ── */}
+                    <div style={{ marginTop: '-6px', textAlign: 'center' }}>
+                      {nextScanSecs !== null ? (
+                        nextScanSecs <= 0 ? (
+                          // Overdue — scanning in progress
+                          <>
+                            <div style={{ fontSize: '10px', color: '#6B7280', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '2px' }}>
+                              Next Scan
+                            </div>
+                            <div style={{
+                              fontFamily: 'var(--font-mono, monospace)',
+                              fontSize: '16px', fontWeight: 700, color: '#10B981',
+                              letterSpacing: '2px',
+                              textShadow: '0 0 10px #10B98166',
+                              animation: 'pulse 1s ease-in-out infinite',
+                            }}>
+                              SCANNING…
+                            </div>
+                          </>
+                        ) : (
+                          <>
+                            <div style={{ fontSize: '10px', color: '#6B7280', letterSpacing: '2px', textTransform: 'uppercase', marginBottom: '2px' }}>
+                              Next Scan
+                            </div>
+                            <div style={{
+                              fontFamily: 'var(--font-mono, monospace)',
+                              fontSize: '22px',
+                              fontWeight: 700,
+                              color: nextScanSecs <= 60 ? '#10B981' : nextScanSecs <= 180 ? '#F59E0B' : bc,
+                              letterSpacing: '2px',
+                              textShadow: `0 0 10px ${nextScanSecs <= 60 ? '#10B981' : nextScanSecs <= 180 ? '#F59E0B' : bc}66`,
+                              transition: 'color 0.5s',
+                            }}>
+                              {`${Math.floor(nextScanSecs / 60)}:${String(nextScanSecs % 60).padStart(2, '0')}`}
+                            </div>
+                          </>
+                        )
+                      ) : (
+                        <div style={{ fontSize: '11px', color: '#4B5563' }}>Engine offline</div>
+                      )}
+                    </div>
                   </div>
                 );
               })()}
 
-              <PnlCard
-                trades={trades}
-                binanceBalance={walletBalance.binance}
-                coinDcxBalance={walletBalance.coindcx}
-                paperPnl={liveStats.paperTotalPnl}
-                livePnl={liveStats.liveTotalPnl}
-                paperPct={liveStats.paperPnlPct}
-                livePct={liveStats.livePnlPct}
-                activeBots={liveStats.activeBots}
-                activeTrades={liveStats.activeTrades}
+              {/* Live Trades Card (right) */}
+              <LiveTradesCard
+                activeTrades={liveModeTrades.length}
+                activeBots={liveBots}
+                pnl={liveStats.liveTotalPnl}
+                pnlPct={liveStats.livePnlPct}
+                deployedCapital={liveStats.liveCapitalDeployed}
+                totalTrades={liveTotalTrades}
+                wins={liveWins}
+                losses={liveLosses}
+                walletBalance={
+                  walletBalance.binance != null || walletBalance.coindcx != null
+                    ? (walletBalance.binance ?? 0) + (walletBalance.coindcx ?? 0)
+                    : null
+                }
               />
             </div>
           </motion.div>
 
 
-          {/* ═══ Row 4: Athena Intelligence ═══ */}
-          {(botState?.athena?.enabled || bots?.some((b: any) => (b.name || '').toLowerCase().includes('athena'))) && (
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.27 }}
-              className="mt-6 mb-8"
-            >
-              <div className="flex flex-col w-full">
-                <AthenaPanel
-                  athena={botState?.athena || { enabled: true, recent_decisions: [], model: 'gemini-2.5-flash' }}
-                  coinStates={multi?.coin_states}
-                  perBot={botState?.perBot || {}}
-                />
-              </div>
-            </motion.div>
-          )}
 
-          {/* ═══ Row 5: Institutional Segment Heatmap ═══ */}
+          {/* ═══ Row 4: Segment Heatmap (left) + Athena Intelligence (right) ═══ */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.24 }}
+            transition={{ delay: 0.22 }}
             className="mb-8"
           >
-            <SegmentHeatmap
-              heatmapData={botState?.heatmap || null}
-            />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '20px', alignItems: 'start' }}>
+              {/* Segment Heatmap — 33% width (left) */}
+              <SegmentHeatmap
+                heatmapData={botState?.heatmap || null}
+              />
+
+              {/* Athena Panel — 67% width (right) */}
+              {(botState?.athena?.enabled || bots?.some((b: any) => (b.name || '').toLowerCase().includes('athena'))) && (
+                <div className="flex flex-col w-full">
+                  <AthenaPanel
+                    athena={botState?.athena || { enabled: true, recent_decisions: [], model: 'gemini-2.5-flash' }}
+                    coinStates={multi?.coin_states}
+                    perBot={botState?.perBot || {}}
+                    vetoLog={multi?.veto_log || []}
+                  />
+                </div>
+              )}
+            </div>
           </motion.div>
 
           {/* ═══ Row 5: Bots Section ═══ */}
-
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.25 }}
+            transition={{ delay: 0.27 }}
             className="mb-12"
           >
             <div className="flex items-center justify-between mb-6">
@@ -647,29 +736,23 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
             </div>
 
             {bots && bots.length > 0 ? (
-              <div className="flex flex-col gap-3">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '14px' }}>
                 {bots.map((bot) => {
-                  // Filter trades for this specific bot
                   const botNameLower = (bot?.name || '').toLowerCase();
                   const botTrades = trades.filter((t: any) => {
-                    // Direct botId match
                     if (t.bot_id && bot?.id && t.bot_id === bot.id) return true;
                     if (t.botId && bot?.id && t.botId === bot.id) return true;
-                    // Bot name matching — extract model keyword for matching
                     const tradeBotName = (t.bot_name || t.botName || '').toLowerCase();
                     if (!tradeBotName) return false;
-                    // Check if the model keyword (adaptive/standard/conservative) appears in both
                     const modelKeywords = ['adaptive', 'standard', 'conservative', 'aggressive'];
                     const tradeModel = modelKeywords.find(k => tradeBotName.includes(k));
                     const botModel = modelKeywords.find(k => botNameLower.includes(k));
                     if (tradeModel && botModel) return tradeModel === botModel;
-                    // Fallback: direct name inclusion
                     return botNameLower.includes(tradeBotName) || tradeBotName.includes(botNameLower);
                   });
-                  // If no trades matched, fall back to all trades only if there's exactly 1 bot
                   const displayTrades = botTrades.length > 0 ? botTrades : (bots.length === 1 ? trades : []);
                   return (
-                    <BotCard key={bot?.id} bot={bot} onToggle={handleBotToggle} onDelete={handleDeleteBot} liveTradeCount={liveActiveTrades.length} trades={displayTrades} />
+                    <BotCard key={bot?.id} bot={bot} onToggle={handleBotToggle} onDelete={handleDeleteBot} onRetire={handleRetireBot} liveTradeCount={liveActiveTrades.length} trades={displayTrades} livePrices={livePrices} />
                   );
                 })}
               </div>
@@ -690,16 +773,29 @@ export function DashboardClient({ user, stats, bots, recentTrades }: DashboardCl
             )}
           </motion.div>
 
+          {/* ═══ Segment Performance Panel (retired bots history) ═══ */}
+          {segmentPerf.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3 }}
+              className="mb-12"
+            >
+              <SegmentPerformancePanel segments={segmentPerf} />
+            </motion.div>
+          )}
 
-          {/* ═══ Row 5: Signal Summary Table ═══ */}
+          {/* ═══ Row 6: Brain Execution Scan Summary ═══ */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.35 }}
             className="mt-8"
           >
-            <SignalSummaryTable coinStates={multi?.coin_states || {}} multi={multi} heatmap={botState?.heatmap || null} botId={bots.find(b => b.isActive)?.id || bots[0]?.id} />
+            <BrainExecutionSummary coinStates={multi?.coin_states || {}} multi={multi} heatmap={botState?.heatmap || null} botId={bots.find(b => b.isActive)?.id || bots[0]?.id} pendingSignals={multi?.pending_signals_detail || []} />
           </motion.div>
+
+
 
         </div>
       </main>

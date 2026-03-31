@@ -3,32 +3,36 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Header } from '@/components/header';
 import { BotCard } from '@/components/bot-card';
+import { SegmentPerformancePanel } from '@/components/segment-performance-panel';
 import {
-  Rocket, X, Info, Search, CheckCircle2, ChevronDown, ChevronRight, Activity, BookOpen
+  Rocket, X, Info, ChevronDown, ChevronRight, BookOpen
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useSession } from 'next-auth/react';
 
 import { SEGMENT_KNOWLEDGE } from '@/lib/segment-knowledge';
 
 interface BotsClientProps { bots: any[]; sessions?: any[]; perfSummary?: any; }
 
 export function BotsClient({ bots: initialBots }: BotsClientProps) {
-  const { data: session } = useSession();
   const [mounted, setMounted] = useState(false);
   const [showDeployModal, setShowDeployModal] = useState(false);
   const [bots, setBots] = useState(initialBots);
   const [loading, setLoading] = useState(false);
+  const [togglingBots, setTogglingBots] = useState<Record<string, boolean>>({});
   const [startAllLoading, setStartAllLoading] = useState(false);
   const [stopAllLoading, setStopAllLoading] = useState(false);
   const [deleteAllLoading, setDeleteAllLoading] = useState(false);
   const [deleteAllConfirm, setDeleteAllConfirm] = useState(false);
+  const [purgeTradesLoading, setPurgeTradesLoading] = useState(false);
+  const [purgeTradesConfirm, setPurgeTradesConfirm] = useState(false);
 
   /* ── Live state ── */
   const [liveTradeCount, setLiveTradeCount] = useState(0);
-  const [liveTrades, setLiveTrades] = useState<any[]>([]);
+  const [tradesByBot, setTradesByBot] = useState<Record<string, any[]>>({});
+  const [livePrices, setLivePrices] = useState<Record<string, number>>({});
   const [allSessions, setAllSessions] = useState<any[]>([]);
   const [perfSummary, setPerfSummary] = useState<any>({ allTimePnl: 0, allTimeRoi: 0, totalSessions: 0 });
+  const [segmentPerf, setSegmentPerf] = useState<any[]>([]);
 
   /* ── Deploy Wizard State ── */
   const [deployType, setDeployType] = useState<'adaptive' | 'segments'>('segments');
@@ -39,10 +43,6 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   const [deployMaxTrades, setDeployMaxTrades] = useState(10);
   const [deployCapitalPerTrade, setDeployCapitalPerTrade] = useState(100);
   
-  const [verifying, setVerifying] = useState(false);
-  const [verifyStatus, setVerifyStatus] = useState<'idle' | 'ok' | 'fail'>('idle');
-  const [verifyBalance, setVerifyBalance] = useState<number | null>(null);
-
   /* ── Intel Drawer State ── */
   const [intelSegmentId, setIntelSegmentId] = useState<string | null>(null);
   const [expandedCoins, setExpandedCoins] = useState<Record<string, boolean>>({});
@@ -50,24 +50,35 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   useEffect(() => { setMounted(true); }, []);
 
   const fetchLiveCount = useCallback(async () => {
+    if (document.hidden) return;
     try {
-      const res = await fetch('/api/bot-state', { cache: 'no-store' });
-      if (res.ok) {
-        const d = await res.json();
+      const [stateRes, perfRes, segRes] = await Promise.all([
+        fetch('/api/bot-state', { cache: 'no-store' }),
+        fetch('/api/performance', { cache: 'no-store' }),
+        fetch('/api/performance/segment', { cache: 'no-store' }),
+      ]);
+      if (stateRes.ok) {
+        const d = await stateRes.json();
         const trades = d?.tradebook?.trades || [];
-        setLiveTrades(trades);
+        setTradesByBot(d?.tradesByBot || {});
+        const cs = d?.multi?.coin_states || {};
+        const prices: Record<string, number> = {};
+        for (const [sym, state] of Object.entries(cs)) {
+          const p = (state as any)?.price;
+          if (p && p > 0) prices[sym] = p;
+        }
+        setLivePrices(prev => ({ ...prev, ...prices }));
         setLiveTradeCount(trades.filter((t: any) => (t.status || '').toUpperCase() === 'ACTIVE').length);
       }
-    } catch { /* silent */ }
-  }, []);
-
-  useEffect(() => {
-    fetch('/api/performance', { cache: 'no-store' })
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
+      if (perfRes.ok) {
+        const d = await perfRes.json();
         if (d) { setAllSessions(d.sessions || []); setPerfSummary(d.summary || perfSummary); }
-      })
-      .catch(() => { });
+      }
+      if (segRes.ok) {
+        const d = await segRes.json();
+        if (d?.segments) setSegmentPerf(d.segments);
+      }
+    } catch { /* silent */ }
   }, []);
 
   useEffect(() => {
@@ -77,27 +88,22 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   }, [fetchLiveCount]);
 
   const handleBotToggle = async (botId: string, currentStatus: boolean) => {
+    if (togglingBots[botId]) return; // prevent double-click
+    setTogglingBots(prev => ({ ...prev, [botId]: true }));
     try {
       const res = await fetch('/api/bots/toggle', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ botId, isActive: !currentStatus }),
       });
-      if (res.ok) window.location.reload();
-    } catch (error) { console.error('Error toggling bot:', error); }
-  };
-
-  const handleVerifyConnection = async () => {
-    setVerifying(true); setVerifyStatus('idle'); setVerifyBalance(null);
-    try {
-      const res = await fetch('/api/wallet-balance');
-      const data = await res.json();
-      const balance = deployExchange === 'coindcx' ? data.coindcx : data.binance;
-      const isConnected = deployExchange === 'coindcx' ? data.coindcxConnected : data.binanceConnected;
-      if (balance !== null && balance !== undefined) { setVerifyStatus('ok'); setVerifyBalance(balance); }
-      else if (isConnected) { setVerifyStatus('ok'); setVerifyBalance(null); }
-      else { setVerifyStatus('fail'); }
-    } catch { setVerifyStatus('fail'); }
-    finally { setVerifying(false); }
+      if (res.ok) {
+        setBots(prev => prev.map((b: any) => b.id === botId ? { ...b, isActive: !currentStatus } : b));
+        fetchLiveCount();
+      } else {
+        const d = await res.json().catch(() => ({}));
+        alert(d.error || 'Failed to toggle bot');
+      }
+    } catch { alert('Failed to toggle bot. Please try again.'); }
+    finally { setTogglingBots(prev => { const n = { ...prev }; delete n[botId]; return n; }); }
   };
 
   const handleDeployBots = async () => {
@@ -108,7 +114,7 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
       if (deployType === 'adaptive') {
         deployments.push({ name: 'ALL', segment: 'ALL', coinList: [] });
       } else if (deployType === 'segments') {
-        if (selectedSegments.length === 0) { alert('Please select at least one segment.'); return; }
+        if (selectedSegments.length === 0) { alert('Please select at least one segment.'); setLoading(false); return; }
         selectedSegments.forEach(segId => {
           deployments.push({ 
             name: segId,
@@ -140,12 +146,31 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ botId }),
       });
-      if (res.ok) window.location.reload();
-      else {
+      if (res.ok) {
+        setBots(prev => prev.filter((b: any) => b.id !== botId));
+        fetchLiveCount();
+      } else {
         const data = await res.json().catch(() => ({}));
         alert(data.error || 'Failed to delete bot. Try stopping it first.');
       }
     } catch { alert('Failed to delete bot. Please try again.'); }
+  };
+
+  const handleRetireBot = async (botId: string) => {
+    try {
+      const res = await fetch('/api/bots/retire', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ botId }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (res.ok) {
+        // Remove from active grid — it now lives in Segment Performance panel
+        setBots(prev => prev.filter((b: any) => b.id !== botId));
+        fetchLiveCount();
+      } else {
+        alert(d.error || 'Failed to retire bot.');
+      }
+    } catch { alert('Failed to retire bot. Please try again.'); }
   };
 
   const handleStopAll = async () => {
@@ -179,10 +204,21 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
     finally { setDeleteAllLoading(false); setDeleteAllConfirm(false); }
   };
 
+  const handlePurgeTrades = async () => {
+    if (!purgeTradesConfirm) { setPurgeTradesConfirm(true); setTimeout(() => setPurgeTradesConfirm(false), 4000); return; }
+    setPurgeTradesLoading(true);
+    try {
+      const res = await fetch('/api/admin/purge-trades', { method: 'POST' });
+      const d = await res.json();
+      if (res.ok) { setPurgeTradesConfirm(false); alert(`✅ Purged ${d.deleted} trades from the database.`); fetchLiveCount(); }
+      else { alert(d.error || 'Failed to purge trades'); }
+    } catch { alert('Failed to purge trades'); }
+    finally { setPurgeTradesLoading(false); setPurgeTradesConfirm(false); }
+  };
+
   const activeBots = bots.filter((b: any) => b?.status !== 'retired');
   const runningBots = activeBots.filter((b: any) => b?.isActive);
   const stoppedBots = activeBots.filter((b: any) => !b?.isActive);
-  const signFmt = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
 
   // Derived Values
   const botMultiplier = deployType === 'adaptive' ? 1 : Math.max(1, selectedSegments.length);
@@ -245,6 +281,9 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
                     {deleteAllLoading ? 'Deleting…' : deleteAllConfirm ? '⚠️ Confirm Delete All' : '🗑 Delete All'}
                   </button>
                 )}
+                <button onClick={handlePurgeTrades} disabled={purgeTradesLoading} className="btn-ghost" style={{ fontSize: 'var(--text-sm)', padding: '10px 16px', color: purgeTradesConfirm ? '#FCD34D' : '#9CA3AF', border: `1px solid ${purgeTradesConfirm ? 'rgba(252,211,77,0.5)' : 'rgba(156,163,175,0.2)'}`, opacity: purgeTradesLoading ? 0.6 : 1, transition: 'all 0.2s' }}>
+                  {purgeTradesLoading ? 'Purging…' : purgeTradesConfirm ? '⚠️ Confirm Purge Trades' : '🧹 Purge All Trades'}
+                </button>
                 <button onClick={() => setShowDeployModal(true)} className="btn-success" style={{ fontSize: 'var(--text-base)', padding: '11px 22px' }}>
                   <Rocket style={{ width: 16, height: 16 }} /> Deploy Launchpad
                 </button>
@@ -274,16 +313,15 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
             </motion.div>
           )}
 
-          {/* ════ BOT CARDS LIST ════ */}
+          {/* ════ BOT CARDS GRID (4×4) ════ */}
           {activeBots.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 14, marginBottom: 40 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 40 }}>
               {activeBots.map((bot, i) => {
                 const botSessions = allSessions.filter((s: any) => s.botId === bot?.id);
-                const botTrades = liveTrades.filter((t: any) => (t.bot_id && bot?.id && t.bot_id === bot.id) || (t.botId && bot?.id && t.botId === bot.id));
-                const displayTrades = botTrades.length > 0 ? botTrades : (activeBots.length === 1 ? liveTrades : []);
+                const displayTrades = tradesByBot[bot?.id] ?? [];
                 return (
                   <motion.div key={bot?.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.06 }}>
-                    <BotCard bot={bot} onToggle={handleBotToggle} onDelete={handleDeleteBot} liveTradeCount={liveTradeCount} trades={displayTrades} sessions={botSessions} />
+                    <BotCard bot={bot} onToggle={handleBotToggle} onDelete={handleDeleteBot} onRetire={handleRetireBot} liveTradeCount={liveTradeCount} trades={displayTrades} sessions={botSessions} livePrices={livePrices} isToggling={!!togglingBots[bot?.id]} />
                   </motion.div>
                 );
               })}
@@ -291,6 +329,10 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
           )}
 
         </div>
+
+        {/* ════ SEGMENT PERFORMANCE PANEL ════ */}
+        <SegmentPerformancePanel segments={segmentPerf} />
+
       </main>
 
       {/* ════ DEPLOY BOT MODAL (LAUNCHPAD) ════ */}

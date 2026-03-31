@@ -1,22 +1,22 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { TrendingUp, TrendingDown, Activity, ArrowRight, Zap } from 'lucide-react';
+import { TrendingUp, TrendingDown, Activity, Zap } from 'lucide-react';
 
 interface SegmentData {
   segment: string;
-  vw_rr: number;
-  btc_alpha: number;
-  breadth_pct: number;
-  composite_score: number;
-  is_positive: boolean;
+  vw_4h: number;
+  breadth_1h: number;
+  blended_score: number;
   abs_score: number;
+  direction: string; // "LONG" | "SHORT"
+  is_cooldown?: boolean;
 }
 
 interface SegmentHeatmapProps {
   heatmapData: {
     timestamp?: string;
-    btc_24h?: number;
+    scoring?: string;
     segments?: SegmentData[];
   } | null;
   loading?: boolean;
@@ -33,88 +33,94 @@ export function SegmentHeatmap({ heatmapData, loading = false }: SegmentHeatmapP
 
   if (!heatmapData || !heatmapData.segments || heatmapData.segments.length === 0) {
     return (
-      <div className="mb-8 p-6 rounded-2xl border border-white/5" style={{ background: 'rgba(17, 24, 39, 0.6)', backdropFilter: 'blur(12px)' }}>
-        <div className="flex items-center gap-3 mb-4">
-          <div className="p-2 rounded-lg bg-cyan-500/10">
+      <div className="mb-8 p-6 rounded-2xl border border-[var(--color-border)]" style={{ background: 'var(--color-surface)', backdropFilter: 'blur(12px)' }}>
+        <div className="flex items-start gap-3 mb-4">
+          <div className="p-2 rounded-lg bg-cyan-500/10 mt-1">
             <Activity className="w-5 h-5 text-cyan-400" />
           </div>
           <div>
-            <h2 className="text-[17px] font-bold text-white flex items-center gap-2">
-              Institutional Segment Heatmap
-              <span className="px-2 py-[2px] rounded text-[10px] font-bold bg-white/10 text-white/70 tracking-wider">LIVE</span>
+            <h2 className="text-[17px] font-bold text-[var(--color-text)] flex items-center gap-2">
+              Segment Heatmap
+              <span className="px-2 py-[2px] rounded text-[10px] font-bold bg-[var(--color-text)]/10 text-[var(--color-text-secondary)] tracking-wider">LIVE</span>
             </h2>
-            <p className="text-[12px] text-gray-400 mt-0.5">3-Pillar Composite Momentum (VW-RR, BTC Alpha, Breadth)</p>
+            <p className="text-[12px] text-[var(--color-text-secondary)] mt-1 max-w-[90%] leading-relaxed">
+              Ranks market sectors by blending 4h momentum with 1h breadth. Bots are dynamically routed to the strongest active sectors to optimize capital efficiency.
+            </p>
           </div>
         </div>
-        <div className="flex items-center justify-center h-24 rounded-xl border border-white/5 bg-white/[0.02]">
-          <p className="text-[13px] text-gray-500 italic">Waiting for first engine cycle — heatmap will appear here</p>
+        <div className="flex items-center justify-center h-24 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-light)]">
+          <p className="text-[13px] text-[var(--color-text-secondary)] italic">Waiting for first engine cycle — heatmap will appear here</p>
         </div>
       </div>
     );
   }
 
+  // Sort by blended_score descending (hottest long → left, coldest short → right)
+  const sortedSegments = [...heatmapData.segments].sort((a, b) => b.blended_score - a.blended_score);
 
-  // Sort by raw composite score (descending) to show hottest on left, coldest on right
-  const sortedSegments = [...heatmapData.segments].sort((a, b) => b.composite_score - a.composite_score);
-  const btc24h = heatmapData.btc_24h || 0;
-
-  // Identify the Top Absolute Momentum segments (the engine scans config.SEGMENT_SCAN_LIMIT, which is 2)
-  const absSorted = [...heatmapData.segments].sort((a, b) => b.abs_score - a.abs_score);
-  const top2Targets = absSorted.slice(0, 2).map((s) => s.segment);
+  // Top 2 by absolute score, EXCLUDING cooldown segments = the sectors the engine is actively scanning
+  const unblockedRanked = [...heatmapData.segments]
+    .filter(s => !s.is_cooldown)
+    .sort((a, b) => b.abs_score - a.abs_score);
+  const top2Targets = unblockedRanked.slice(0, 2).map((s) => s.segment);
 
   return (
-    <div className="mb-8 p-6 rounded-2xl border border-white/5" style={{ background: 'rgba(17, 24, 39, 0.6)', backdropFilter: 'blur(12px)' }}>
+    <div className="mb-8 p-6 rounded-2xl border border-[var(--color-border)]" style={{ background: 'var(--color-surface)', backdropFilter: 'blur(12px)' }}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-5">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-cyan-500/10">
+      <div className="mb-4">
+        <div className="flex items-start gap-3 mb-3">
+          <div className="p-2 rounded-lg bg-cyan-500/10 mt-1">
             <Activity className="w-5 h-5 text-cyan-400" />
           </div>
           <div>
-            <h2 className="text-[17px] font-bold text-white flex items-center gap-2">
-              Institutional Segment Heatmap
-              <span className="px-2 py-[2px] rounded text-[10px] font-bold bg-white/10 text-white/70 tracking-wider">LIVE</span>
+            <h2 className="text-[15px] font-bold text-[var(--color-text)] flex items-center gap-2">
+              Segment Heatmap
+              <span className="px-2 py-[2px] rounded text-[10px] font-bold bg-[var(--color-text)]/10 text-[var(--color-text-secondary)] tracking-wider">LIVE</span>
             </h2>
-            <p className="text-[12px] text-gray-400 mt-0.5">
-              3-Pillar Composite Momentum (VW-RR, BTC Alpha, Breadth) | BTC 24H: <span className={btc24h >= 0 ? "text-green-400" : "text-red-400"}>{btc24h > 0 ? "+" : ""}{btc24h.toFixed(2)}%</span>
+            <p className="text-[11px] text-[var(--color-text-secondary)] mt-1 max-w-[90%] leading-relaxed">
+              Ranks market sectors by blending 4h momentum with 1h breadth. Bots are dynamically routed to the strongest active sectors to optimize capital efficiency.
             </p>
           </div>
         </div>
-        
-        <div className="text-right">
-          <div className="text-[11px] text-gray-400 font-semibold tracking-wide uppercase mb-1">Active Scan Targets</div>
-          <div className="flex items-center gap-2">
-            {top2Targets.map((seg, idx) => (
-              <div key={seg} className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20">
-                <Zap className="w-3 h-3 text-cyan-400" />
-                <span className="text-[12px] font-bold text-cyan-400">{seg}</span>
-              </div>
-            ))}
+
+        <div>
+          <div className="text-[10px] text-gray-400 font-semibold tracking-wide uppercase mb-1">Active Targets</div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {top2Targets.map((seg) => {
+              const segData = heatmapData.segments!.find(s => s.segment === seg);
+              const isLong = segData?.direction === 'LONG';
+              return (
+                <div key={seg} className={`flex items-center gap-1 px-2 py-0.5 rounded-full border ${isLong ? 'bg-green-500/10 border-green-500/20' : 'bg-red-500/10 border-red-500/20'}`}>
+                  <Zap className={`w-3 h-3 ${isLong ? 'text-green-400' : 'text-red-400'}`} />
+                  <span className={`text-[11px] font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>{seg}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
 
       {/* Heatmap Grid */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 gap-2">
         {sortedSegments.map((seg, i) => {
           const isHot = top2Targets.includes(seg.segment);
-          const isPositive = seg.composite_score >= 0;
-          
-          // Color intensity based on 0-to-10 scale magnitude (clamped)
-          const magnitude = Math.min(Math.abs(seg.composite_score) / 5, 1);
-          const bgOpacity = 0.05 + (magnitude * 0.15); // ranges 0.05 -> 0.20
-          
-          const primaryColor = isPositive ? 'rgba(34, 197, 94' : 'rgba(239, 68, 68'; // green or red
-          const bgColor = `${primaryColor}, ${bgOpacity})`;
+          const isCooldown = !!seg.is_cooldown;
+          const isPositive = seg.blended_score >= 0;
+
+          const magnitude = Math.min(Math.abs(seg.blended_score) / 3, 1);
+          const bgOpacity = 0.05 + (magnitude * 0.15);
+
+          const primaryColor = isCooldown ? 'rgba(107, 114, 128' : (isPositive ? 'rgba(34, 197, 94' : 'rgba(239, 68, 68');
+          const bgColor = `${primaryColor}, ${isCooldown ? 0.05 : bgOpacity})`;
           const borderColor = isHot ? `${primaryColor}, 0.5)` : `${primaryColor}, 0.1)`;
 
           return (
-            <motion.div 
+            <motion.div
               key={seg.segment}
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               transition={{ delay: i * 0.05 }}
-              className="relative p-4 rounded-xl flex flex-col justify-between"
+              className={`relative p-4 rounded-xl flex flex-col justify-between ${isCooldown ? 'opacity-50 grayscale select-none' : ''}`}
               style={{
                 background: bgColor,
                 border: `1px solid ${borderColor}`,
@@ -129,31 +135,28 @@ export function SegmentHeatmap({ heatmapData, loading = false }: SegmentHeatmapP
               )}
 
               <div className="flex justify-between items-start mb-3">
-                <span className="text-sm font-bold text-white tracking-wide">{seg.segment}</span>
+                <div className="flex flex-col">
+                  <span className="text-sm font-bold text-[var(--color-text)] tracking-wide">{seg.segment}</span>
+                  {isCooldown && <span className="text-[9px] font-bold text-gray-400 tracking-wider">COOLDOWN</span>}
+                </div>
                 <div className="flex items-center gap-1">
-                  {isPositive ? <TrendingUp className="w-3.5 h-3.5 text-green-400" /> : <TrendingDown className="w-3.5 h-3.5 text-red-400" />}
-                  <span className={`text-sm font-bold ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
-                    {isPositive ? '+' : ''}{seg.composite_score.toFixed(2)}
+                  {!isCooldown && (isPositive ? <TrendingUp className="w-3.5 h-3.5 text-green-400" /> : <TrendingDown className="w-3.5 h-3.5 text-red-400" />)}
+                  <span className={`text-sm font-bold ${isCooldown ? 'text-gray-400' : (isPositive ? 'text-green-400' : 'text-red-400')}`}>
+                    {isPositive && !isCooldown ? '+' : ''}{seg.blended_score.toFixed(2)}
                   </span>
                 </div>
               </div>
 
               <div className="space-y-1.5 mt-auto">
                 <div className="flex justify-between items-center text-[11px]">
-                  <span className="text-gray-400">Vol-W Return (VW-RR)</span>
-                  <span className={`font-medium ${seg.vw_rr >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
-                    {seg.vw_rr >= 0 ? '+' : ''}{seg.vw_rr.toFixed(1)}%
+                  <span className="text-[var(--color-text-secondary)]">4h Return</span>
+                  <span className={`font-medium ${seg.vw_4h >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
+                    {seg.vw_4h >= 0 ? '+' : ''}{seg.vw_4h.toFixed(1)}%
                   </span>
                 </div>
-                <div className="flex justify-between items-center text-[11px]">
-                  <span className="text-gray-400">BTC Alpha</span>
-                  <span className={`font-medium ${seg.btc_alpha >= 0 ? 'text-green-400/80' : 'text-red-400/80'}`}>
-                    {seg.btc_alpha >= 0 ? '+' : ''}{seg.btc_alpha.toFixed(1)}%
-                  </span>
-                </div>
-                <div className="flex justify-between items-center text-[11px] pt-1 mt-1 border-t border-white/5">
-                  <span className="text-gray-400">Breadth</span>
-                  <span className="text-white/80 font-medium">{seg.breadth_pct.toFixed(0)}%</span>
+                <div className="flex justify-between items-center text-[11px] pt-1 mt-1 border-t border-[var(--color-border)]">
+                  <span className="text-[var(--color-text-secondary)]">1h Breadth</span>
+                  <span className="text-[var(--color-text)] opacity-80 font-medium">{seg.breadth_1h.toFixed(0)}%</span>
                 </div>
               </div>
             </motion.div>

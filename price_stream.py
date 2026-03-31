@@ -20,6 +20,19 @@ Reconnect behaviour:
 import threading
 import logging
 import time
+import urllib.request
+import json as _json
+import asyncio
+
+# Patch asyncio to allow nested event loops — fixes the
+# "RuntimeError: This event loop is already running" crash that occurs
+# when the watchdog restarts ThreadedWebsocketManager from a thread
+# that already has an event loop.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass  # nest_asyncio not installed — rely on fresh event loop creation
 
 logger = logging.getLogger("PriceStream")
 
@@ -27,6 +40,11 @@ logger = logging.getLogger("PriceStream")
 STALE_THRESHOLD_SECONDS = 60
 # How long (seconds) to wait between watchdog checks
 WATCHDOG_INTERVAL_SECONDS = 20
+# How long (seconds) to wait before retrying a failed subscription
+SUB_RETRY_COOLDOWN_SECONDS = 60   # reduced from 300 — retry failed subs faster
+# REST fallback: poll prices via REST when WS is unavailable
+REST_POLL_INTERVAL_SECONDS = 5    # poll every 5s (vs 100ms WS, but better than 300s gap)
+BINANCE_REST_PRICE_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
 
 
 class PriceStreamManager:
@@ -48,6 +66,8 @@ class PriceStreamManager:
         self._running = False
         self._last_update: dict[str, float] = {}   # symbol → epoch of last update
         self._watchdog_thread: threading.Thread | None = None
+        self._failed_subs: dict[str, float] = {}   # symbol → epoch of last failure (cooldown guard)
+        self._rest_poll_thread: threading.Thread | None = None  # REST fallback thread
 
     # ─── Public API ─────────────────────────────────────────────────────────
 
@@ -103,17 +123,44 @@ class PriceStreamManager:
     # ─── Internal ───────────────────────────────────────────────────────────
 
     def _init_twm(self):
-        """Initialize (or re-initialize) the ThreadedWebsocketManager."""
+        """Initialize (or re-initialize) the ThreadedWebsocketManager.
+        
+        On failure, automatically starts a REST fallback polling thread so prices
+        stay fresh even when the Binance WebSocket fails to initialize.
+        """
         try:
             from binance import ThreadedWebsocketManager
-            # API keys not required for public market data streams
-            twm = ThreadedWebsocketManager(api_key="", api_secret="")
+            # Force a fresh event loop for this thread — the previous TWM may have
+            # left its loop attached, causing 'RuntimeError: event loop already running'
+            # on restart.
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Close the stale loop and create a brand new one
+                    asyncio.set_event_loop(asyncio.new_event_loop())
+                    logger.debug("PriceStream: replaced running event loop with fresh one")
+            except RuntimeError:
+                # No current event loop — create one
+                asyncio.set_event_loop(asyncio.new_event_loop())
+
+            # Pass None (not "") for public market data streams — empty strings cause
+            # auth failures on some network environments (e.g. Railway) even for
+            # unauthenticated endpoints.
+            twm = ThreadedWebsocketManager(api_key=None, api_secret=None)
             twm.start()
             self._twm = twm
+            # Clear failed-sub cooldowns on successful (re-)init so all symbols retry
+            with self._lock:
+                self._failed_subs.clear()
             logger.info("⚡ PriceStream: ThreadedWebsocketManager ready")
         except Exception as e:
-            logger.error("❌ PriceStream: Failed to init WebSocket manager: %s", e)
+            logger.warning(
+                "⚠️ PriceStream: WebSocket init failed (%s) — using REST fallback poll every %ds",
+                e, REST_POLL_INTERVAL_SECONDS
+            )
             self._twm = None
+            # Start REST fallback so prices don't go stale for 300s
+            self._start_rest_fallback()
 
     def _stop_twm(self):
         """Tear down the current ThreadedWebsocketManager cleanly."""
@@ -130,6 +177,17 @@ class PriceStreamManager:
         """Subscribe a single symbol to the bookTicker stream."""
         if not self._twm:
             return
+
+        # Cooldown guard — don't retry a recently-failed subscription every heartbeat.
+        # After a failure, wait SUB_RETRY_COOLDOWN_SECONDS before trying again.
+        now = time.time()
+        with self._lock:
+            last_fail = self._failed_subs.get(sym, 0)
+        if now - last_fail < SUB_RETRY_COOLDOWN_SECONDS:
+            remaining = int(SUB_RETRY_COOLDOWN_SECONDS - (now - last_fail))
+            logger.debug("PriceStream: %s sub cooldown active (%ds remaining) — skip", sym, remaining)
+            return
+
         try:
             key = self._twm.start_symbol_book_ticker_socket(
                 callback=self._on_message,
@@ -138,9 +196,57 @@ class PriceStreamManager:
             with self._lock:
                 self._streams[sym] = key
                 self._subscribed.add(sym)
+                self._failed_subs.pop(sym, None)  # clear failure on success
             logger.info("📡 PriceStream: Subscribed to %s bookTicker", sym)
         except Exception as e:
-            logger.warning("⚠️ PriceStream: Failed to subscribe %s: %s", sym, e)
+            with self._lock:
+                self._failed_subs[sym] = now  # record failure time for cooldown
+            logger.warning(
+                "⚠️ PriceStream: Failed to subscribe %s: %s (retry in %ds)",
+                sym, e, SUB_RETRY_COOLDOWN_SECONDS
+            )
+
+    def _start_rest_fallback(self):
+        """Start a background REST polling thread as fallback when WebSocket is unavailable.
+        
+        Polls Binance Futures REST /fapi/v1/ticker/price every REST_POLL_INTERVAL_SECONDS.
+        Only fetches prices for currently subscribed symbols.
+        Stops automatically when WebSocket becomes available (twm is set).
+        """
+        if self._rest_poll_thread and self._rest_poll_thread.is_alive():
+            return  # already running
+
+        def rest_poll():
+            logger.info("📡 PriceStream REST fallback: polling every %ds", REST_POLL_INTERVAL_SECONDS)
+            while self._running:
+                # If WebSocket comes back, let it take over — REST stays as safety net
+                with self._lock:
+                    symbols = list(self._subscribed)
+                if symbols:
+                    try:
+                        url = BINANCE_REST_PRICE_URL
+                        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = _json.loads(resp.read())
+                        # data is a list of {"symbol": "BTCUSDT", "price": "85000.00"}
+                        price_map = {item["symbol"]: float(item["price"]) for item in data if "symbol" in item}
+                        now = time.time()
+                        with self._lock:
+                            for sym in symbols:
+                                if sym in price_map:
+                                    # Only update if WS hasn't updated recently (WS takes priority)
+                                    last_ws = self._last_update.get(sym, 0)
+                                    if now - last_ws > REST_POLL_INTERVAL_SECONDS:
+                                        self._prices[sym] = price_map[sym]
+                                        self._last_update[sym] = now
+                    except Exception as e:
+                        logger.debug("PriceStream REST poll error: %s", e)
+                time.sleep(REST_POLL_INTERVAL_SECONDS)
+            logger.info("📡 PriceStream REST fallback: stopped")
+
+        t = threading.Thread(target=rest_poll, name="PriceStream-REST", daemon=True)
+        t.start()
+        self._rest_poll_thread = t
 
     def _start_watchdog(self):
         """Start a background thread that monitors connection health."""
@@ -196,9 +302,11 @@ class PriceStreamManager:
             return
 
         # Re-subscribe to ALL previously subscribed symbols
+        # Also reset failed-sub cooldowns so all symbols get a fresh attempt
         with self._lock:
             to_resubscribe = set(self._subscribed)
             self._subscribed.clear()     # clear so _subscribe_one adds them back
+            self._failed_subs.clear()    # reset cooldowns — fresh TWM deserves fresh retry
 
         for sym in to_resubscribe:
             self._subscribe_one(sym)

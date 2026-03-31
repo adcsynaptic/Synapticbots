@@ -3,12 +3,12 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Header } from '@/components/header';
 import { ActiveTradesChart } from '@/components/active-trades-chart';
-import { Download, Search, X, BarChart3, Trash2 } from 'lucide-react';
+import { Download, Search, X, BarChart3, Trash2, Zap } from 'lucide-react';
 import { motion } from 'framer-motion';
 
 /* ═══ Types ═══ */
 interface Trade {
-  id: string; coin: string; symbol?: string; position: string; regime: string;
+  id: string; dbId?: string; engineTradeId?: string | null; coin: string; symbol?: string; position: string; regime: string;
   confidence: number; leverage: number; capital: number;
   entryPrice: number; currentPrice?: number | null;
   exitPrice?: number | null; stopLoss: number; takeProfit: number;
@@ -26,6 +26,10 @@ interface Trade {
   steppedLockLevel?: number;           // which step is active (-1=none, 0=step1…9=step10)
   trailSlCount?: number;               // how many times SL was ratcheted up
   trailingActive?: boolean;            // whether trailing has kicked in
+  // Exit guard fields
+  exitGuardActive?: boolean;           // should_auto_close — confirms exit checks are running
+  exitCheckAt?: string | null;         // ISO timestamp of last exit check heartbeat
+  exitCheckPrice?: number | null;      // price used in last exit check
 }
 
 /* ═══ Utilities ═══ */
@@ -85,15 +89,15 @@ function mapTrade(t: any): Trade {
 
     const slDist = Math.abs(entryPrice - sl);
     const tpDist = Math.abs(tp - entryPrice);
-    const maxSaneDist = entryPrice * 0.20; // SL/TP should be within 20% of entry
+    const maxSaneDist = entryPrice * 0.12; // SL/TP should be within 12% of entry (tightened from 20%)
 
     // Detect garbage: SL/TP too far from entry, or SL on wrong side for position
     const slGarbage = sl <= 0 || slDist > maxSaneDist ||
-      (isLong && sl > entryPrice * 1.01) ||  // LONG SL should be below entry
-      (!isLong && sl < entryPrice * 0.99);    // SHORT SL should be above entry
+      (isLong && sl > entryPrice * 1.005) ||  // LONG SL should be below entry
+      (!isLong && sl < entryPrice * 0.995);    // SHORT SL should be above entry
     const tpGarbage = tp <= 0 || tpDist > maxSaneDist ||
-      (isLong && tp < entryPrice * 0.99) ||  // LONG TP should be above entry
-      (!isLong && tp > entryPrice * 1.01);    // SHORT TP should be below entry
+      (isLong && tp < entryPrice * 0.995) ||  // LONG TP should be above entry
+      (!isLong && tp > entryPrice * 1.005);    // SHORT TP should be below entry
 
     if (slGarbage) {
       sl = isLong
@@ -109,6 +113,8 @@ function mapTrade(t: any): Trade {
 
   return {
     id: uniqueId,
+    dbId: t.dbId,
+    engineTradeId: baseId,
     coin: sym.replace('USDT', ''),
     symbol: sym,
     position: (t.side || t.position || '').toLowerCase(),
@@ -144,11 +150,15 @@ function mapTrade(t: any): Trade {
     })(),
     botName: t.bot_name || t.botName || 'Unknown Bot',
     botId: t.bot_id || t.botId || null,
-    // Trailing SL — use trailingSl (from API) or fall back to raw trailing_sl field
+    // Trailing SL
     trailingSl: t.trailingSl ?? t.trailing_sl ?? null,
     steppedLockLevel: t.steppedLockLevel ?? t.stepped_lock_level ?? -1,
     trailSlCount: t.trailSlCount ?? t.trail_sl_count ?? 0,
     trailingActive: t.trailingActive ?? t.trailing_active ?? false,
+    // Exit guard
+    exitGuardActive: t.exitGuardActive ?? t.exit_guard_active ?? true,
+    exitCheckAt:     t.exitCheckAt     ?? t.exit_check_at     ?? null,
+    exitCheckPrice:  t.exitCheckPrice  ?? t.exit_check_price  ?? null,
   };
 }
 
@@ -156,8 +166,8 @@ function mapTrade(t: any): Trade {
 function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return (
     <div className={className} style={{
-      background: 'rgba(17, 24, 39, 0.8)', backdropFilter: 'blur(12px)',
-      border: '1px solid rgba(255,255,255,0.06)', borderRadius: '16px', padding: '20px',
+      background: 'var(--color-surface)', backdropFilter: 'blur(12px)',
+      border: '1px solid var(--color-border)', borderRadius: '16px', padding: '20px',
     }}>{children}</div>
   );
 }
@@ -165,9 +175,9 @@ function Card({ children, className = '' }: { children: React.ReactNode; classNa
 function StatCard({ label, value, sub, color }: { label: string; value: string; sub?: string; color?: string }) {
   return (
     <Card>
-      <div style={{ fontSize: '10px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', color: '#6B7280', marginBottom: '6px' }}>{label}</div>
-      <div style={{ fontSize: '22px', fontWeight: 700, color: color || '#F0F4F8' }}>{value}</div>
-      {sub && <div style={{ fontSize: '11px', color: '#6B7280', marginTop: '4px' }}>{sub}</div>}
+      <div style={{ fontSize: '10px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '1px', color: 'var(--color-text-secondary)', marginBottom: '6px' }}>{label}</div>
+      <div style={{ fontSize: '22px', fontWeight: 700, color: color || 'var(--color-text)' }}>{value}</div>
+      {sub && <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginTop: '4px' }}>{sub}</div>}
     </Card>
   );
 }
@@ -181,28 +191,81 @@ interface TradesClientProps { trades: Trade[]; }
 export function TradesClient({ trades: initialTrades }: TradesClientProps) {
   const [mounted, setMounted] = useState(false);
   const [trades, setTrades] = useState<Trade[]>(initialTrades);
+  // ── Live LTP via Binance WebSocket ──────────────────────────────────────
+  // Uses a SINGLE persistent !miniTicker@arr stream (all symbols, ~1s cadence).
+  // Filtering to active-trade symbols happens inside the handler — no reconnect loop.
+  const [ltpPrices, setLtpPrices] = useState<Record<string, number>>({});
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'closed'>('active');
-  const [closingTradeId, setClosingTradeId] = useState<string | null>(null);
-  const [confirmingTradeId, setConfirmingTradeId] = useState<string | null>(null);
-  const [confirmingClear, setConfirmingClear] = useState(false);
-  const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
-  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
 
-  const [livePrices, setLivePrices] = useState<Record<string, number>>({});
   const [posFilter, setPosFilter] = useState<string>('all');
   const [coinSearch, setCoinSearch] = useState('');
   const [pnlFilter, setPnlFilter] = useState<'all' | 'profit' | 'loss'>('all');
-  const [modeFilter, setModeFilter] = useState<'all' | 'paper' | 'live'>('all');
+  const [modeFilter, setModeFilter] = useState<'all' | 'paper' | 'live'>('paper');
   const [sessionFilter, setSessionFilter] = useState<string>('all');
   const [isClearing, setIsClearing] = useState(false);
   const [clearSuccess, setClearSuccess] = useState<string | null>(null);
-  const [isExitingAll, setIsExitingAll] = useState(false);
-  const [confirmExitAll, setConfirmExitAll] = useState(false);
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [deletingTradeId, setDeletingTradeId] = useState<string | null>(null);
+  const [closingTradeId, setClosingTradeId] = useState<string | null>(null);
+  const [isClosingAll, setIsClosingAll] = useState(false);
+  const [confirmingCloseAll, setConfirmingCloseAll] = useState(false);
   const clearPauseRef = useRef(false);
+
+  // Stable ref so the WS handler always sees the latest active symbols without reconnecting
+  const activeSymbolsRef = useRef<Set<string>>(new Set());
+
+  // ── Single persistent Binance !miniTicker@arr WebSocket ────────────────
+  // One connection for all symbols — no per-symbol subscription, no reconnect loop.
+  useEffect(() => {
+    let ws: WebSocket;
+    let reconnectTimer: ReturnType<typeof setTimeout>;
+
+    const connect = () => {
+      ws = new WebSocket('wss://stream.binance.com:9443/ws/!miniTicker@arr');
+      ws.onmessage = (ev) => {
+        try {
+          const arr: { s: string; c: string }[] = JSON.parse(ev.data);
+          if (!Array.isArray(arr)) return;
+          const updates: Record<string, number> = {};
+          for (const d of arr) {
+            if (d.s && d.c && activeSymbolsRef.current.has(d.s)) {
+              updates[d.s] = parseFloat(d.c);
+            }
+          }
+          if (Object.keys(updates).length > 0) {
+            setLtpPrices(prev => ({ ...prev, ...updates }));
+          }
+        } catch {}
+      };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+      ws.onclose = () => {
+        // Auto-reconnect after 2s on unexpected close
+        reconnectTimer = setTimeout(connect, 2000);
+      };
+    };
+
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer);
+      try { ws.close(); } catch {}
+    };
+  // Mount-only — single persistent connection for the page lifetime
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keep activeSymbolsRef in sync with current active trades (no WS reconnect needed)
+  useEffect(() => {
+    const activeTrades = trades.filter(t => (t.status || '').toLowerCase() === 'active');
+    activeSymbolsRef.current = new Set(
+      activeTrades.map(t => (t.symbol || t.coin + 'USDT').toUpperCase())
+    );
+  }, [trades]);
 
   useEffect(() => { setMounted(true); }, []);
 
-  // Auto-refresh from Prisma (user-scoped) every 15s.
+
+
+
   // Previously: called /api/bot-state → engine JSON → ALL users' trades (bug).
   // Now: calls /api/trades → Prisma → only this user's trades, user-isolated.
   const refreshTrades = useCallback(async () => {
@@ -217,43 +280,6 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
   }, []);
 
 
-  // Live price polling from Binance REST every 3s for active trade symbols
-  // Uses Binance /api/v3/ticker/price directly — reliable, no pair-name confusion
-  useEffect(() => {
-    async function fetchLivePrices() {
-      const activeTrades = (trades ?? []).filter(t => (t.status || '').toLowerCase() === 'active');
-      const activeSymbols = [...new Set(activeTrades.map(tradeSym).filter(Boolean))];
-      if (activeSymbols.length === 0) return;
-
-      const entryPriceBySymbol: Record<string, number> = {};
-      activeTrades.forEach(t => { entryPriceBySymbol[tradeSym(t)] = t.entryPrice || 0; });
-
-      try {
-        // Fetch all active symbols in one batch request (max 100 in Binance batch)
-        const symbolsParam = encodeURIComponent(JSON.stringify(activeSymbols));
-        const res = await fetch(
-          `https://api.binance.com/api/v3/ticker/price?symbols=${symbolsParam}`,
-          { cache: 'no-store', signal: AbortSignal.timeout(4000) }
-        );
-        if (res.ok) {
-          const data: { symbol: string; price: string }[] = await res.json();
-          const map: Record<string, number> = {};
-          data.forEach(({ symbol, price }) => {
-            const p = parseFloat(price);
-            const entry = entryPriceBySymbol[symbol] || 0;
-            // Sanity check: price must be > 0 and within 5x of entry (catches wrong-pair maps)
-            if (p > 0 && (entry === 0 || (p > entry * 0.01 && p < entry * 10))) {
-              map[symbol] = p;
-            }
-          });
-          if (Object.keys(map).length > 0) setLivePrices(map);
-        }
-      } catch { /* silent — keep last known prices */ }
-    }
-    fetchLivePrices();
-    const timer = setInterval(fetchLivePrices, 1000);
-    return () => clearInterval(timer);
-  }, [trades]);
 
   useEffect(() => {
     refreshTrades(); // initial fetch
@@ -305,16 +331,27 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
     const losses = closed.filter(t => t.totalPnl <= 0);
     const winRate = closed.length > 0 ? (wins.length / closed.length) * 100 : 0;
     const realizedPnl = closed.reduce((s, t) => s + (t.totalPnl || 0), 0);
-    // Recalculate unrealized PnL from live prices (matches table P&L formula)
+
+    // Use live WS price first, fallback to DB currentPrice, last resort entryPrice
+    const getLivePrice = (t: Trade) => {
+      const sym = (t.symbol || t.coin + 'USDT').toUpperCase();
+      return ltpPrices[sym] ?? t.currentPrice ?? t.entryPrice;
+    };
+
+    // Recalculate unrealized PnL from live prices
+    // Skip entries where PnL% > ±500% (garbage/cross-contaminated data)
     const unrealizedPnl = active.reduce((s, t) => {
-      const cp = livePrices[tradeSym(t)] || t.currentPrice || t.entryPrice;
-      return s + calcLivePnl(t, cp).pnl;
+      const cp = getLivePrice(t);
+      const { pnl, pnlPct } = calcLivePnl(t, cp);
+      if (Math.abs(pnlPct) > 500) return s; // skip stale/corrupt
+      return s + pnl;
     }, 0);
     const combinedPnl = realizedPnl + unrealizedPnl;
 
     const activePnlPcts = active.map(t => {
-      const cp = livePrices[tradeSym(t)] || t.currentPrice || t.entryPrice;
-      return calcLivePnl(t, cp).pnlPct;
+      const cp = getLivePrice(t);
+      const { pnlPct } = calcLivePnl(t, cp);
+      return Math.abs(pnlPct) > 500 ? 0 : pnlPct; // cap garbage
     });
     const allPnlPcts = [
       ...closed.map(t => t.totalPnlPercent || 0),
@@ -348,14 +385,22 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
     const avgLoss = losses.length > 0 ? grossLoss / losses.length : 1;
     const riskReward = avgLoss > 0 ? avgWin / avgLoss : 0;
 
+    const totalFees = closed.reduce((s: number, t: any) => s + (t.fee || 0), 0);
+    const realizedPnlAfterFees = realizedPnl;
+
     return {
       total: all.length, active: active.length, closed: closed.length,
       wins: wins.length, losses: losses.length, winRate,
       realizedPnl, unrealizedPnl, combinedPnl,
+      totalFees, realizedPnlAfterFees,
       bestTrade, worstTrade,
       maxDD, maxDDPct, profitFactor, riskReward,
     };
-  }, [modeFiltered, livePrices]);
+  // ltpPrices drives live unrealized PnL — must be a dependency
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modeFiltered, ltpPrices]);
+
+
 
   /* ── CSV Export (all trades, respects mode filter only) ── */
   const exportCSV = () => {
@@ -424,7 +469,83 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
     }
   };
 
+  const closeTrade = async (uiKey: string, dbId: string, symbol: string, mode: string) => {
+    if (!window.confirm(`Close active trade for ${symbol}?`)) return;
+    setClosingTradeId(uiKey);
+    try {
+      const res = await fetch('/api/trades/close', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tradeId: dbId, symbol, mode })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showMsg(`🛑 Closed ${symbol} trade successfully`, 4000);
+        refreshTrades();
+      } else {
+        showMsg(`❌ ${data.error || 'Failed to close trade'}`);
+      }
+    } catch {
+      showMsg('❌ Network error');
+    } finally {
+      setClosingTradeId(null);
+    }
+  };
+
+  const closeAllActiveTrades = async () => {
+    if (!confirmingCloseAll) {
+      setConfirmingCloseAll(true);
+      setTimeout(() => setConfirmingCloseAll(false), 5000);
+      return;
+    }
+    setConfirmingCloseAll(false);
+    setIsClosingAll(true);
+    setClearSuccess(null);
+    try {
+      const res = await fetch('/api/trades/close-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: modeFilter })
+      });
+      if (res.ok) {
+        showMsg('🛑 All active trades closed successfully', 6000);
+        refreshTrades();
+      } else {
+        const err = await res.json();
+        showMsg(`❌ ${err.error || 'Failed to close trades'}`);
+      }
+    } catch {
+      showMsg('❌ Network error');
+    } finally {
+      setIsClosingAll(false);
+    }
+  };
+
+  const deleteTrade = async (uiKey: string, dbId: string) => {
+    if (!window.confirm('Delete this trade from the database?')) return;
+    setDeletingTradeId(uiKey);
+    console.log('[deleteTrade] Deleting trade', { uiKey, dbId });
+    try {
+      const res = await fetch(`/api/trades?id=${encodeURIComponent(dbId)}`, { method: 'DELETE' });
+      const data = await res.json();
+      console.log('[deleteTrade] Response:', res.status, data);
+      if (res.ok) {
+        setTrades(prev => prev.filter(t => t.id !== uiKey && t.dbId !== dbId));
+        showMsg('🗑️ Trade deleted', 4000);
+      } else {
+        console.error('[deleteTrade] Error:', data);
+        showMsg(`❌ ${data.error || 'Failed to delete trade'}`);
+      }
+    } catch (err) {
+      console.error('[deleteTrade] Network error:', err);
+      showMsg('❌ Network error');
+    } finally {
+      setDeletingTradeId(null);
+    }
+  };
+
   if (!mounted) return null;
+
 
   return (
     <div className="min-h-screen">
@@ -448,48 +569,19 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                 }}>
                   <Download size={14} /> Export CSV
                 </button>
-                {/* Exit All — two-click confirmation */}
-                <button
-                  onClick={async () => {
-                    if (!confirmExitAll) {
-                      setConfirmExitAll(true);
-                      setTimeout(() => setConfirmExitAll(false), 5000);
-                      return;
-                    }
-                    setIsExitingAll(true);
-                    setConfirmExitAll(false);
-                    try {
-                      const res = await fetch('/api/trades/exit-all', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ mode: modeFilter }),
-                      });
-                      const data = await res.json();
-                      if (data.success) {
-                        showMsg(`Exited ${data.totalClosed} trades · PnL: $${(data.totalPnl || 0).toFixed(2)}`, 8000);
-                        refreshTrades();
-                      } else {
-                        showMsg(`Error: ${data.error}`);
-                      }
-                    } catch {
-                      showMsg('Exit all failed');
-                    } finally {
-                      setIsExitingAll(false);
-                    }
-                  }}
-                  disabled={isExitingAll}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: '6px',
-                    padding: '10px 14px', borderRadius: '12px', border: 'none',
-                    background: confirmExitAll ? 'rgba(245,158,11,0.3)' : 'rgba(245,158,11,0.1)',
-                    color: '#F59E0B',
-                    fontSize: '13px', fontWeight: 600, cursor: 'pointer',
-                    opacity: isExitingAll ? 0.5 : 1,
-                    ...(confirmExitAll ? { border: '1px solid #F59E0B' } : {}),
-                  }}
-                >
-                  ⚡ {isExitingAll ? 'Exiting...' : confirmExitAll ? '⚠️ Confirm Exit All' : `Exit All${modeFilter !== 'all' ? ` (${modeFilter})` : ''}`}
+
+                <button onClick={closeAllActiveTrades} disabled={isClosingAll} style={{
+                  display: 'flex', alignItems: 'center', gap: '6px',
+                  padding: '10px 14px', borderRadius: '12px', border: 'none',
+                  background: confirmingCloseAll ? 'rgba(245,158,11,0.3)' : 'rgba(245,158,11,0.1)',
+                  color: '#F59E0B',
+                  fontSize: '13px', fontWeight: 600, cursor: 'pointer',
+                  opacity: isClosingAll ? 0.5 : 1,
+                  ...(confirmingCloseAll ? { animation: 'pulse 1s infinite', border: '1px solid #F59E0B' } : {}),
+                }}>
+                  <Zap size={14} /> {isClosingAll ? 'Closing...' : confirmingCloseAll ? '⚠️ Click again to confirm' : 'Close Active Trades'}
                 </button>
+
                 <button onClick={clearAllTrades} disabled={isClearing} style={{
                   display: 'flex', alignItems: 'center', gap: '6px',
                   padding: '10px 14px', borderRadius: '12px', border: 'none',
@@ -510,11 +602,11 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
           {/* ═══ Portfolio Summary Stats ═══ */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }} className="mb-6">
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '12px' }}>
-              <StatCard label="Total Trades" value={String(stats.total)} sub={`${stats.active} active · ${stats.closed} closed`} />
+              <StatCard label="Active Trades" value={String(stats.active)} sub={`${stats.total} total · ${stats.closed} closed`} color="#00E5FF" />
+              <StatCard label="Total PNL" value={'$' + fmt$(stats.combinedPnl)} sub={`Realized (net): $${fmt$(stats.realizedPnlAfterFees)} · Active: $${fmt$(stats.unrealizedPnl)}`} color={pnlColor(stats.combinedPnl)} />
+              <StatCard label="Realized PNL (net fees)" value={'$' + fmt$(stats.realizedPnlAfterFees)} sub={`Gross: $${fmt$(stats.realizedPnl)} · Fees: $${stats.totalFees.toFixed(2)}`} color={pnlColor(stats.realizedPnlAfterFees)} />
+              <StatCard label="Unrealized PNL" value={'$' + fmt$(stats.unrealizedPnl)} sub={`${stats.active} active position${stats.active !== 1 ? 's' : ''}`} color={pnlColor(stats.unrealizedPnl)} />
               <StatCard label="Win Rate" value={stats.winRate.toFixed(1) + '%'} sub={`${stats.wins}W / ${stats.losses}L`} color={stats.winRate >= 50 ? '#22C55E' : '#EF4444'} />
-              <StatCard label="Total PNL" value={'$' + fmt$(stats.combinedPnl)} sub={`Realized: $${fmt$(stats.realizedPnl)} · Active: $${fmt$(stats.unrealizedPnl)}`} color={pnlColor(stats.combinedPnl)} />
-              <StatCard label="Active PNL" value={'$' + fmt$(stats.unrealizedPnl)} sub={`${stats.active} open positions`} color={pnlColor(stats.unrealizedPnl)} />
-              <StatCard label="Best / Worst" value={fmtPct(stats.bestTrade)} sub={fmtPct(stats.worstTrade) + ' worst'} color={pnlColor(stats.bestTrade)} />
               <StatCard label="Max Drawdown" value={stats.maxDDPct.toFixed(2) + '%'} sub={`$${stats.maxDD.toFixed(2)} · PF: ${stats.profitFactor === Infinity ? '∞' : stats.profitFactor.toFixed(2)}`} color="#EF4444" />
             </div>
           </motion.div>
@@ -532,8 +624,8 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                   <button key={s} onClick={() => setStatusFilter(s)} style={{
                     padding: '6px 14px', borderRadius: '8px', border: 'none', cursor: 'pointer',
                     fontSize: '13px', fontWeight: 600,
-                    background: statusFilter === s ? '#0891B2' : 'rgba(255,255,255,0.05)',
-                    color: statusFilter === s ? '#fff' : '#9CA3AF',
+                    background: statusFilter === s ? '#0891B2' : 'var(--color-surface-light)',
+                    color: statusFilter === s ? '#fff' : 'var(--color-text-secondary)',
                     transition: 'all 0.2s',
                   }}>
                     {s === 'all' ? `All (${stats.total})` : s === 'active' ? `Active (${stats.active})` : `Closed (${stats.closed})`}
@@ -556,8 +648,8 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                 )}
 
                 <select value={posFilter} onChange={e => setPosFilter(e.target.value)} style={{
-                  padding: '6px 10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)',
-                  background: 'rgba(255,255,255,0.04)', color: '#D1D5DB', fontSize: '13px',
+                  padding: '6px 10px', borderRadius: '8px', border: '1px solid var(--color-border)',
+                  background: 'var(--color-surface-light)', color: 'var(--color-text)', fontSize: '13px',
                 }}>
                   <option value="all">All Positions</option>
                   <option value="long">Long / Buy</option>
@@ -567,44 +659,27 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
 
 
                 <select value={pnlFilter} onChange={e => setPnlFilter(e.target.value as any)} style={{
-                  padding: '6px 10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)',
-                  background: 'rgba(255,255,255,0.04)', color: '#D1D5DB', fontSize: '13px',
+                  padding: '6px 10px', borderRadius: '8px', border: '1px solid var(--color-border)',
+                  background: 'var(--color-surface-light)', color: 'var(--color-text)', fontSize: '13px',
                 }}>
                   <option value="all">All P&L</option>
                   <option value="profit">Profit Only</option>
                   <option value="loss">Loss Only</option>
                 </select>
 
-                <div style={{ display: 'inline-flex', gap: '0', borderRadius: '8px', overflow: 'hidden', border: '1px solid rgba(255,255,255,0.1)' }}>
-                  {(['paper', 'live'] as const).map(m => (
-                    <button key={m} onClick={() => setModeFilter(prev => prev === m ? 'all' : m)} style={{
-                      padding: '6px 14px', border: 'none', cursor: 'pointer',
-                      fontSize: '12px', fontWeight: 600,
-                      background: modeFilter === m
-                        ? m === 'paper' ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'
-                        : 'transparent',
-                      color: modeFilter === m
-                        ? m === 'paper' ? '#22C55E' : '#EF4444'
-                        : '#6B7280',
-                      borderRight: m === 'paper' ? '1px solid rgba(255,255,255,0.08)' : 'none',
-                      transition: 'all 0.2s',
-                    }}>
-                      {m === 'paper' ? '🟢 Paper' : '🔴 Live'}
-                    </button>
-                  ))}
-                </div>
+
 
                 <div style={{ marginLeft: 'auto', position: 'relative' }}>
-                  <Search size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: '#6B7280' }} />
+                  <Search size={14} style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-secondary)' }} />
                   <input value={coinSearch} onChange={e => setCoinSearch(e.target.value)}
                     placeholder="Search coin..."
                     style={{
-                      padding: '6px 10px 6px 30px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)',
-                      background: 'rgba(255,255,255,0.04)', color: '#D1D5DB', fontSize: '13px', width: '150px',
+                      padding: '6px 10px 6px 30px', borderRadius: '8px', border: '1px solid var(--color-border)',
+                      background: 'var(--color-surface-light)', color: 'var(--color-text)', fontSize: '13px', width: '150px',
                     }} />
                   {coinSearch && (
                     <X size={12} onClick={() => setCoinSearch('')}
-                      style={{ position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)', cursor: 'pointer', color: '#6B7280' }} />
+                      style={{ position: 'absolute', right: '8px', top: '50%', transform: 'translateY(-50%)', cursor: 'pointer', color: 'var(--color-text-secondary)' }} />
                   )}
                 </div>
               </div>
@@ -622,12 +697,12 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                 <div style={{ overflowX: 'auto', maxHeight: '600px', overflowY: 'auto' }}>
                   <table style={{ width: '100%', minWidth: '1300px', borderCollapse: 'collapse', fontSize: '17px' }}>
                     <thead>
-                      <tr style={{ borderBottom: '2px solid rgba(255,255,255,0.08)' }}>
-                        {['Bot', 'Coin', 'Position', 'Leverage', 'Capital', 'Entry', 'LTP', 'Stop Loss', 'SL Step', 'Target Price', 'PnL', 'Fee', 'Net PnL', 'Exit', 'Action'].map(h => (
+                        <tr style={{ borderBottom: '2px solid var(--color-border)' }}>
+                         {['Bot', 'Coin', 'Position', 'Leverage', 'Capital', 'Entry', 'LTP', 'Stop Loss', 'SL Step', 'Target Price', 'PnL', 'Fee', 'Net PnL', 'Exit', ''].map(h => (
                           <th key={h} style={{
-                            padding: '10px 10px', textAlign: h === 'Bot' || h === 'Coin' ? 'left' : 'center',
-                            fontSize: '11px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px',
-                            color: '#6B7280', position: 'sticky', top: 0, background: 'rgba(17, 24, 39, 0.95)',
+                            padding: '12px 14px', textAlign: h === 'Bot' || h === 'Coin' ? 'left' : 'center',
+                            fontSize: '13px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.8px',
+                            color: 'var(--color-text-secondary)', position: 'sticky', top: 0, background: 'var(--color-surface)',
                           }}>{h}</th>
                         ))}
                       </tr>
@@ -636,28 +711,30 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                       {filtered.map(t => {
                         const isActive = (t.status || '').toLowerCase() === 'active';
                         const sym = tradeSym(t);
-                        const livePrice = livePrices[sym];
-                        const currentPrice = isActive ? (livePrice || t.currentPrice || t.entryPrice) : null;
+                        // LIVE FIX: always prefer live WS price over stale DB currentPrice
+                        const livePrice = ltpPrices[sym] ?? null;
+                        const currentPrice = isActive
+                          ? (livePrice ?? t.currentPrice ?? t.entryPrice)
+                          : null;
                         const isLong = tradeIsLong(t);
-                        const { pnl, pnlPct } = isActive && currentPrice
+                        const rawPnl = isActive && currentPrice
                           ? calcLivePnl(t, currentPrice)
                           : { pnl: t.totalPnl, pnlPct: t.totalPnlPercent };
 
+                        // SANITY GUARD: if pnl% > ±500% it's clearly stale/corrupt — show as stale
+                        const pnlIsStale = isActive && Math.abs(rawPnl.pnlPct) > 500;
+                        const { pnl, pnlPct } = pnlIsStale
+                          ? { pnl: 0, pnlPct: 0 }
+                          : rawPnl;
+
                         return (
-                          <tr key={t.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
-                            <td style={{ padding: '10px', color: '#0891B2', fontWeight: 600, fontSize: '12px' }}>
+                          <tr key={t.id} style={{ borderBottom: '1px solid var(--color-border)' }}>
+                            <td style={{ padding: '12px 14px', color: '#0891B2', fontWeight: 600, fontSize: '14px' }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                                 {t.botName || 'Unknown Bot'}
-                                <span style={{
-                                  fontSize: '9px', fontWeight: 700, padding: '1px 5px', borderRadius: '4px',
-                                  background: isActive ? 'rgba(34,197,94,0.15)' : 'rgba(107,114,128,0.15)',
-                                  color: isActive ? '#22C55E' : '#9CA3AF',
-                                }}>
-                                  {isActive ? 'ACTIVE' : 'CLOSED'}
-                                </span>
                               </div>
                               {t.sessionId && (
-                                <div style={{ fontSize: '9px', color: '#6B7280', marginTop: '2px' }}>
+                                <div style={{ fontSize: '11px', color: 'var(--color-text-secondary)', marginTop: '2px' }}>
                                   {(() => {
                                     const idx = uniqueSessions.indexOf(t.sessionId);
                                     return idx === -1 ? 'Legacy' : `Run #${uniqueSessions.length - idx}`;
@@ -665,31 +742,42 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                                 </div>
                               )}
                             </td>
-                            <td style={{ padding: '10px', fontWeight: 700, color: '#F0F4F8' }}>
+                            <td style={{ padding: '12px 14px', fontWeight: 700, color: 'var(--color-text)', fontSize: '14px' }}>
                               {t.coin.replace('USDT', '')}
                             </td>
-                            <td style={{ padding: '10px', textAlign: 'center' }}>
+                            <td style={{ padding: '12px 14px', textAlign: 'center' }}>
                               <span style={{
-                                padding: '2px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700,
+                                padding: '3px 10px', borderRadius: '6px', fontSize: '12px', fontWeight: 700,
                                 color: isLong ? '#22C55E' : '#EF4444',
                                 background: isLong ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)',
                               }}>
                                 {isLong ? 'LONG' : 'SHORT'}
                               </span>
                             </td>
-                            <td style={{ padding: '10px', textAlign: 'center', color: '#D1D5DB' }}>{t.leverage}×</td>
-                            <td style={{ padding: '10px', textAlign: 'center', color: '#D1D5DB' }}>${t.capital}</td>
-                            <td style={{ padding: '10px', textAlign: 'center', color: '#D1D5DB', fontFamily: 'monospace', fontSize: '12px' }}>{fmtPrice(t.entryPrice)}</td>
-                            <td style={{ padding: '10px', textAlign: 'center', fontFamily: 'monospace', fontSize: '12px' }}>
-                              {isActive && currentPrice ? (
-                                <span style={{ color: livePrice ? '#22C55E' : '#9CA3AF', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
-                                  {livePrice && <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: '#22C55E', animation: 'pulse 2s infinite', display: 'inline-block' }} />}
-                                  {fmtPrice(currentPrice)}
-                                </span>
-                              ) : <span style={{ color: '#6B7280' }}>—</span>}
-                            </td>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', color: 'var(--color-text)', fontSize: '14px' }}>{t.leverage}×</td>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', color: 'var(--color-text)', fontSize: '14px' }}>${t.capital}</td>
+                             <td style={{ padding: '12px 14px', textAlign: 'center', color: 'var(--color-text)', fontFamily: 'monospace', fontSize: '14px' }}>{fmtPrice(t.entryPrice)}</td>
+
+                             {/* LTP — live last traded price from Binance WebSocket */}
+                             <td style={{ padding: '12px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '14px' }}>
+                               {(() => {
+                                 const sym = (t.symbol || t.coin + 'USDT').toUpperCase();
+                                 const ltp = ltpPrices[sym] ?? (isActive ? t.currentPrice : null);
+                                 if (!ltp) return <span style={{ color: '#4B5563' }}>—</span>;
+                                 const up = ltp >= t.entryPrice;
+                                 return (
+                                   <span style={{
+                                     color: up ? '#22C55E' : '#EF4444',
+                                     fontWeight: 700,
+                                   }}>
+                                     {fmtPrice(ltp)}
+                                   </span>
+                                 );
+                               })()}
+                             </td>
+
                             {/* Stop Loss — shows trailing_sl for active trades (updates live as SL ratchets up) */}
-                            <td style={{ padding: '10px', textAlign: 'center', fontFamily: 'monospace', fontSize: '12px' }}>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '14px' }}>
                               {(() => {
                                 const liveSl = isActive && (t.trailingSl ?? 0) > 0 ? t.trailingSl! : t.stopLoss;
                                 const isTrailing = isActive && t.trailingActive;
@@ -700,14 +788,14 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                                       {fmtPrice(liveSl)}
                                     </span>
                                     {isTrailing && t.stopLoss !== liveSl && (
-                                      <span style={{ fontSize: '9px', color: '#6B7280' }}>orig: {fmtPrice(t.stopLoss)}</span>
+                                      <span style={{ fontSize: '11px', color: '#6B7280' }}>orig: {fmtPrice(t.stopLoss)}</span>
                                     )}
                                   </div>
                                 );
                               })()}
                             </td>
                             {/* SL Step — shows which trailing step is active */}
-                            <td style={{ padding: '10px', textAlign: 'center' }}>
+                            <td style={{ padding: '12px 14px', textAlign: 'center' }}>
                               {isActive ? (() => {
                                 const lvl = t.steppedLockLevel ?? -1;
                                 const count = t.trailSlCount ?? 0;
@@ -717,136 +805,87 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
                                   '+25%', '+30%', '+35%', '+40%', '+45%',
                                 ];
                                 if (lvl < 0) {
-                                  return <span style={{ fontSize: '10px', color: '#4B5563' }}>—</span>;
+                                  return <span style={{ fontSize: '12px', color: '#4B5563' }}>—</span>;
                                 }
                                 return (
                                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px' }}>
                                     <span style={{
-                                      fontSize: '10px', fontWeight: 700,
+                                      fontSize: '12px', fontWeight: 700,
                                       background: 'rgba(245,158,11,0.15)', color: '#F59E0B',
                                       border: '1px solid rgba(245,158,11,0.3)',
-                                      borderRadius: '6px', padding: '2px 7px',
+                                      borderRadius: '6px', padding: '3px 9px',
                                     }}>
                                       Step {lvl + 1} · {stepLabels[lvl] ?? `+${(lvl + 1) * 5}%`}
                                     </span>
-                                    <span style={{ fontSize: '9px', color: '#6B7280' }}>{count}× moved</span>
+                                    <span style={{ fontSize: '11px', color: '#6B7280' }}>{count}× moved</span>
                                   </div>
                                 );
-                              })() : <span style={{ fontSize: '10px', color: '#4B5563' }}>—</span>}
+                              })() : <span style={{ fontSize: '12px', color: '#4B5563' }}>—</span>}
                             </td>
-                            <td style={{ padding: '10px', textAlign: 'center', color: '#22C55E', fontFamily: 'monospace', fontSize: '12px' }}>{fmtPrice(t.takeProfit)}</td>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', color: '#22C55E', fontFamily: 'monospace', fontSize: '14px' }}>{fmtPrice(t.takeProfit)}</td>
 
-                            <td style={{ padding: '10px', textAlign: 'center', fontWeight: 700, color: pnlColor(pnl) }}>
-                              {fmt$(pnl)} <span style={{ fontSize: '10px', fontWeight: 600, color: pnlColor(pnlPct) }}>({fmtPct(pnlPct)})</span>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', fontWeight: 700, fontSize: '14px', color: pnlIsStale ? '#6B7280' : pnlColor(pnl) }}>
+                              {pnlIsStale
+                                ? <span style={{ fontSize: '12px', color: '#6B7280' }}>Stale</span>
+                                : <>{fmt$(pnl)} <span style={{ fontSize: '12px', fontWeight: 600, color: pnlColor(pnlPct) }}>({fmtPct(pnlPct)})</span></>
+                              }
                             </td>
-                            <td style={{ padding: '10px', textAlign: 'center', fontFamily: 'monospace', fontSize: '11px', color: t.fee > 0 ? '#F59E0B' : '#4B5563' }}>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '13px', color: t.fee > 0 ? '#F59E0B' : 'var(--color-text-secondary)' }}>
                               {!isActive && t.fee > 0 ? `$${t.fee.toFixed(4)}` : '—'}
                             </td>
-                            <td style={{ padding: '10px', textAlign: 'center', fontWeight: 700, fontFamily: 'monospace', fontSize: '12px', color: pnlColor(pnl - (isActive ? 0 : t.fee)) }}>
-                              {fmt$(pnl - (isActive ? 0 : t.fee))}
+                            <td style={{ padding: '12px 14px', textAlign: 'center', fontWeight: 700, fontFamily: 'monospace', fontSize: '14px', color: pnlIsStale ? '#6B7280' : pnlColor(pnl - (isActive ? 0 : t.fee)) }}>
+                              {pnlIsStale ? '—' : fmt$(pnl - (isActive ? 0 : t.fee))}
                             </td>
 
-                            <td style={{ padding: '10px', textAlign: 'center', fontFamily: 'monospace', fontSize: '12px', color: '#D1D5DB' }}>
+                            <td style={{ padding: '12px 14px', textAlign: 'center', fontFamily: 'monospace', fontSize: '14px', color: 'var(--color-text)' }}>
                               {!isActive && t.exitPrice ? fmtPrice(t.exitPrice) : '—'}
                             </td>
 
-                            <td style={{ padding: '10px', textAlign: 'center' }}>
-                              {isActive && (
+                            {/* Per-trade delete/close buttons */}
+                            <td style={{ padding: '8px 6px', textAlign: 'center' }}>
+                              <div style={{ display: 'flex', gap: '4px', justifyContent: 'center' }}>
+                                {isActive && (
+                                  <button
+                                    onClick={() => closeTrade(t.id, t.engineTradeId || t.dbId || t.id, t.symbol || t.coin, t.mode || 'paper')}
+                                    disabled={closingTradeId === t.id}
+                                    title="Manually Close Trade"
+                                    style={{
+                                      background: 'rgba(245,158,11,0.08)',
+                                      border: '1px solid rgba(245,158,11,0.25)',
+                                      borderRadius: '6px', padding: '4px 8px', cursor: 'pointer',
+                                      color: '#F59E0B',
+                                      fontSize: '13px', lineHeight: 1,
+                                      opacity: closingTradeId === t.id ? 0.5 : 1,
+                                    }}
+                                  >
+                                    {closingTradeId === t.id ? '…' : '🛑'}
+                                  </button>
+                                )}
                                 <button
-                                  disabled={closingTradeId === t.id}
-                                  onClick={async () => {
-                                    // Two-click pattern: first click shows confirm, second executes
-                                    if (confirmingTradeId !== t.id) {
-                                      setConfirmingTradeId(t.id);
-                                      setTimeout(() => setConfirmingTradeId(prev => prev === t.id ? null : prev), 5000);
-                                      return;
-                                    }
-                                    setConfirmingTradeId(null);
-                                    setClosingTradeId(t.id);
-                                    try {
-                                      const res = await fetch('/api/trades/close', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ tradeId: t.id, symbol: t.symbol }),
-                                      });
-                                      if (res.ok) {
-                                        // Remove from local state immediately
-                                        setTrades(prev => prev.filter(tr => tr.id !== t.id));
-                                      } else {
-                                        const err = await res.json();
-                                        showMsg(`❌ ${err.error || 'Failed to close trade'}`);
-                                      }
-                                    } catch {
-                                      showMsg('❌ Network error');
-                                    } finally {
-                                      setClosingTradeId(null);
-                                    }
-                                  }}
-                                  style={{
-                                    padding: '4px 10px', borderRadius: '6px',
-                                    border: confirmingTradeId === t.id ? '1px solid #22C55E' : 'none',
-                                    fontSize: '10px', fontWeight: 700, cursor: 'pointer',
-                                    background: pnl >= 0 ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)',
-                                    color: pnl >= 0 ? '#22C55E' : '#EF4444',
-                                    transition: 'all 0.2s',
-                                    opacity: closingTradeId === t.id ? 0.5 : 1,
-                                  }}
-                                >
-                                  {closingTradeId === t.id ? '...' : confirmingTradeId === t.id ? '⚡ Confirm?' : pnl >= 0 ? '💰 Book Profit' : '✕ Close'}
-                                </button>
-                              )}
-                              {/* Delete button — closed trades only */}
-                              {!isActive && (
-                                <button
-                                  disabled={deletingTradeId === t.id}
-                                  onClick={async () => {
-                                    if (confirmingDeleteId !== t.id) {
-                                      setConfirmingDeleteId(t.id);
-                                      setTimeout(() => setConfirmingDeleteId(prev => prev === t.id ? null : prev), 3000);
-                                      return;
-                                    }
-                                    setConfirmingDeleteId(null);
-                                    setDeletingTradeId(t.id);
-                                    try {
-                                      const res = await fetch('/api/trades/delete', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ tradeId: t.id }),
-                                      });
-                                      if (res.ok) {
-                                        setTrades(prev => prev.filter(tr => tr.id !== t.id));
-                                      } else {
-                                        const err = await res.json();
-                                        showMsg(`❌ ${err.error || 'Failed to delete'}`);
-                                      }
-                                    } catch {
-                                      showMsg('❌ Network error');
-                                    } finally {
-                                      setDeletingTradeId(null);
-                                    }
-                                  }}
-                                  title="Delete this trade from DB"
-                                  style={{
-                                    padding: '4px 8px', borderRadius: '6px',
-                                    border: confirmingDeleteId === t.id ? '1px solid #EF4444' : '1px solid rgba(255,255,255,0.08)',
-                                    fontSize: '10px', fontWeight: 700, cursor: 'pointer',
-                                    background: confirmingDeleteId === t.id ? 'rgba(239,68,68,0.25)' : 'rgba(255,255,255,0.04)',
-                                    color: confirmingDeleteId === t.id ? '#EF4444' : '#6B7280',
-                                    transition: 'all 0.2s',
-                                    opacity: deletingTradeId === t.id ? 0.4 : 1,
-                                  }}
-                                >
-                                  {deletingTradeId === t.id ? '...' : confirmingDeleteId === t.id ? '⚠️ Sure?' : '🗑'}
-                                </button>
-                              )}
+                                  onClick={() => deleteTrade(t.id, t.dbId || t.id)}
+                                disabled={deletingTradeId === t.id}
+                                title="Delete this trade from DB"
+                                style={{
+                                  background: 'rgba(239,68,68,0.08)',
+                                  border: '1px solid rgba(239,68,68,0.25)',
+                                  borderRadius: '6px', padding: '4px 8px', cursor: 'pointer',
+                                  color: '#EF4444',
+                                  fontSize: '13px', lineHeight: 1,
+                                  opacity: deletingTradeId === t.id ? 0.5 : 1,
+                                }}
+                              >
+                                {deletingTradeId === t.id ? '…' : '🗑️'}
+                              </button>
+                             </div>
                             </td>
+
                           </tr>
                         );
                       })}
                     </tbody>
                   </table>
                 </div>
-                <div style={{ marginTop: '12px', fontSize: '12px', color: '#6B7280', textAlign: 'right' }}>
+                <div style={{ marginTop: '12px', fontSize: '12px', color: 'var(--color-text-secondary)', textAlign: 'right' }}>
                   Showing {filtered.length} of {trades.length} trades
                 </div>
               </Card>
@@ -854,8 +893,8 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
               <Card>
                 <div style={{ textAlign: 'center', padding: '60px 0' }}>
                   <div style={{ width: '48px', height: '48px', borderRadius: '12px', background: 'rgba(8,145,178,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 12px' }}><BarChart3 size={24} style={{ color: '#0891B2' }} /></div>
-                  <div style={{ fontSize: '18px', fontWeight: 600, color: '#D1D5DB', marginBottom: '8px' }}>No Trades Found</div>
-                  <div style={{ fontSize: '14px', color: '#6B7280' }}>
+                  <div style={{ fontSize: '18px', fontWeight: 600, color: 'var(--color-text)', marginBottom: '8px' }}>No Trades Found</div>
+                  <div style={{ fontSize: '14px', color: 'var(--color-text-secondary)' }}>
                     {statusFilter === 'all' ? 'Deploy a bot to start trading' : `No ${statusFilter} trades match your filters`}
                   </div>
                 </div>
@@ -1070,6 +1109,8 @@ export function TradesClient({ trades: initialTrades }: TradesClientProps) {
               </motion.div>
             );
           })()}
+
+
 
         </div>
       </main>

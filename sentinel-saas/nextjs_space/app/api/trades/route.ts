@@ -45,11 +45,11 @@ export async function GET(request: NextRequest) {
         const page = parseInt(searchParams.get('page') || '1');
         const limit = Math.min(parseInt(searchParams.get('limit') || '50'), 100);
 
-        // Sync engine trades into Prisma for this user's bots before reading
-        // MULTI-BOT FIX: fetch ALL bots and sync each one
+        // Sync engine trades into Prisma for this user's ACTIVE bots before reading
+        // Retired bots are excluded — their data lives in the Segment Performance panel
         const userBots = await prisma.bot.findMany({
-            where: { userId },
-            include: { config: true },  // F5 FIX: include config so mode is available
+            where: { userId, status: { not: 'retired' } },
+            include: { config: true },
             orderBy: { updatedAt: 'desc' },
         });
 
@@ -57,14 +57,16 @@ export async function GET(request: NextRequest) {
         // Paper bots get paper trades, live bots get live trades — no cross-contamination
         const engineTradeCache: Record<string, any[]> = {};
         for (const ub of userBots) {
-            if (!ub.startedAt) continue;
             const botMode: EngineMode = ((ub.config as any)?.mode || 'paper').toLowerCase().includes('live') ? 'live' : 'paper';
             try {
                 if (!engineTradeCache[botMode]) {
                     engineTradeCache[botMode] = await fetchEngineTrades(botMode);
                 }
                 if (engineTradeCache[botMode].length > 0) {
-                    await syncEngineTrades(engineTradeCache[botMode], ub.id, ub.startedAt);
+                    // Epoch fallback: if startedAt is null, sync ALL trades (entryTime filter skipped)
+                    const syncFrom = ub.startedAt ?? new Date(0);
+                    const botSegment = (ub.config as any)?.segment || 'ALL';
+                    await syncEngineTrades(engineTradeCache[botMode], ub.id, syncFrom, userId, botSegment);
                 }
             } catch (err) {
                 console.error(`[trades] Sync failed for bot ${ub.id} (${botMode}):`, err);
@@ -94,6 +96,7 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({
             trades: paged.map((t: any) => ({
                 id: t.trade_id || `T-${Math.random().toString(36).slice(2, 8)}`,
+                dbId: t.id,  // Prisma row ID — used for delete operations
                 coin: (t.symbol || t.coin || '').replace('USDT', ''),
                 symbol: t.symbol || t.coin || '',
                 position: (t.side || t.position || '').toLowerCase(),
@@ -110,9 +113,13 @@ export async function GET(request: NextRequest) {
                 status: (t.status || '').toLowerCase(),
                 // Trailing SL fields — stored in tradebook per trade
                 trailingSl: t.trailing_sl ?? t.stop_loss ?? t.stopLoss ?? 0,
-                steppedLockLevel: t.stepped_lock_level ?? -1,   // -1=no step hit yet, 0-9=step index
-                trailSlCount: t.trail_sl_count ?? 0,             // how many times SL has moved
+                steppedLockLevel: t.stepped_lock_level ?? -1,
+                trailSlCount: t.trail_sl_count ?? 0,
                 trailingActive: t.trailing_active ?? false,
+                // Exit guard state — stamped every heartbeat
+                exitGuardActive: t.exit_guard_active ?? true,
+                exitCheckAt: t.exit_check_at ?? null,
+                exitCheckPrice: t.exit_check_price ?? null,
 
                 activePnl: t.unrealized_pnl || t.active_pnl || t.activePnl || 0,
                 activePnlPercent: t.unrealized_pnl_pct || t.activePnlPercent || 0,
@@ -144,8 +151,38 @@ export async function DELETE(request: Request) {
         if (!session?.user) {
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
-        // For now, trades from JSON are read-only
-        return NextResponse.json({ error: 'Use /api/reset-trades to clear your trades' }, { status: 400 });
+
+        const userId = (session.user as any).id;
+        const { searchParams } = new URL(request.url);
+        // Accept either `id` (Prisma dbId) or legacy `trade_id`
+        const tradeId = searchParams.get('id') || searchParams.get('dbId');
+
+        if (!tradeId) {
+            return NextResponse.json({ error: 'Missing ?id= param (use dbId from trade row)' }, { status: 400 });
+        }
+
+        // Verify ownership: trade must belong to one of this user's bots
+        const trade = await prisma.trade.findFirst({
+            where: { id: tradeId, bot: { userId } },
+        });
+
+        if (!trade) {
+            // Also try matching by exchangeOrderId (engine trade_id) as fallback
+            const byEngineId = await prisma.trade.findFirst({
+                where: { exchangeOrderId: tradeId, bot: { userId } },
+            });
+            if (!byEngineId) {
+                return NextResponse.json({ error: 'Trade not found or not yours' }, { status: 404 });
+            }
+            await prisma.trade.delete({ where: { id: byEngineId.id } });
+            console.log(`[trades] Deleted trade by engineId ${tradeId} (prismaId: ${byEngineId.id}) for user ${userId}`);
+            return NextResponse.json({ success: true, deleted: byEngineId.id });
+        }
+
+        await prisma.trade.delete({ where: { id: tradeId } });
+        console.log(`[trades] Deleted trade ${tradeId} for user ${userId}`);
+        return NextResponse.json({ success: true, deleted: tradeId });
+
     } catch (error: any) {
         console.error('Tradebook DELETE error:', error);
         return NextResponse.json({ error: 'Failed to delete trade' }, { status: 500 });

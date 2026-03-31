@@ -197,15 +197,7 @@ COIN_FEATURES = {
         "amihud_illiquidity",
         "exhaustion_tail"
     ],
-    "AKTUSDT": [
-        "rel_strength_btc",
-        "log_return",
-        "vol_zscore",
-        "volume_trend_intensity",
-        "exhaustion_tail",
-        "liquidity_vacuum",
-        "amihud_illiquidity"
-    ],
+
     "API3USDT": [
         "vol_zscore",
         "log_return",
@@ -475,16 +467,7 @@ COIN_FEATURES = {
         "bb_width_norm",
         "rel_strength_btc"
     ],
-    "KASUSDT": [
-        "exhaustion_tail",
-        "vol_zscore",
-        "volatility",
-        "volume_trend_intensity",
-        "log_return",
-        "vwap_dist",
-        "bb_width_norm",
-        "rel_strength_btc"
-    ],
+
     "NEARUSDT": [
         "exhaustion_tail",
         "vol_zscore",
@@ -694,52 +677,8 @@ COIN_FEATURES = {
         "vwap_dist",
         "bb_width_norm"
     ],
-    "1000BONKUSDT": [
-        "log_return",
-        "volatility",
-        "volume_change",
-        "vol_zscore",
-        "rel_strength_btc",
-        "liquidity_vacuum",
-        "exhaustion_tail",
-        "vwap_dist",
-        "bb_width_norm"
-    ],
-    "1000PEPEUSDT": [
-        "exhaustion_tail",
-        "vol_zscore",
-        "liquidity_vacuum",
-        "volume_trend_intensity",
-        "volatility",
-        "log_return",
-        "amihud_illiquidity",
-        "vwap_dist",
-        "bb_width_norm",
-        "rel_strength_btc"
-    ],
-    "1000SHIBUSDT": [
-        "exhaustion_tail",
-        "vol_zscore",
-        "amihud_illiquidity",
-        "volume_trend_intensity",
-        "liquidity_vacuum",
-        "volatility",
-        "log_return",
-        "vwap_dist",
-        "bb_width_norm",
-        "rel_strength_btc"
-    ],
-    "MEWUSDT": [
-        "log_return",
-        "volatility",
-        "volume_change",
-        "vol_zscore",
-        "rel_strength_btc",
-        "liquidity_vacuum",
-        "exhaustion_tail",
-        "vwap_dist",
-        "bb_width_norm"
-    ],
+    # NOTE: 1000BONKUSDT/PEPEUSDT/SHIBUSDT are futures-only — spot versions below
+    # NOTE: MEWUSDT, AKTUSDT, KASUSDT not listed on Binance spot
     "NOTUSDT": [
         "exhaustion_tail",
         "vol_zscore",
@@ -834,6 +773,60 @@ COIN_FEATURES = {
         "vwap_dist",
         "bb_width_norm",
         "rel_strength_btc"
+    ],
+
+    # ── Meme: same-coin proxies (1000x denomination equivalents) ─────────────
+    "BONKUSDT": [
+        "log_return",
+        "volatility",
+        "volume_change",
+        "vol_zscore",
+        "rel_strength_btc",
+        "liquidity_vacuum",
+        "exhaustion_tail",
+        "vwap_dist",
+        "bb_width_norm"
+    ],
+
+    "PEPEUSDT": [
+        "exhaustion_tail",
+        "vol_zscore",
+        "liquidity_vacuum",
+        "volume_trend_intensity",
+        "volatility",
+        "log_return",
+        "amihud_illiquidity",
+        "vwap_dist",
+        "bb_width_norm",
+        "rel_strength_btc"
+    ],
+
+    "SHIBUSDT": [
+        "exhaustion_tail",
+        "vol_zscore",
+        "amihud_illiquidity",
+        "volume_trend_intensity",
+        "liquidity_vacuum",
+        "volatility",
+        "log_return",
+        "vwap_dist",
+        "bb_width_norm",
+        "rel_strength_btc"
+    ],
+
+    # ── L2: Mantle — thin L2 book, vacuum-dominant (proxy: OPUSDT) ───────────
+
+    # ── DePIN: IoT/wireless infra — narrative-driven (proxy: ARUSDT) ─────────
+    "HNTUSDT": [
+        "log_return",
+        "vol_zscore",
+        "rel_strength_btc",
+        "liquidity_vacuum",
+        "volume_trend_intensity",
+        "exhaustion_tail",
+        "amihud_illiquidity",
+        "vwap_dist",
+        "bb_width_norm"
     ],
 }
 

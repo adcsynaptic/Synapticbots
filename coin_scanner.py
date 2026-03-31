@@ -14,7 +14,7 @@ import pandas as pd
 import numpy as np
 
 import config
-from data_pipeline import fetch_klines, _get_binance_client
+from data_pipeline import fetch_klines, _get_binance_client, get_cached_ticker
 from feature_engine import compute_hmm_features, compute_all_features
 from hmm_brain import HMMBrain
 
@@ -27,7 +27,7 @@ SCANNER_STATE_FILE = os.path.join(config.DATA_DIR, "scanner_state.json")
 COIN_EXCLUDE = {
     "EURUSDT", "WBTCUSDT", "USDCUSDT", "TUSDUSDT", "BUSDUSDT",
     "USTUSDT", "DAIUSDT", "FDUSDUSDT", "CVCUSDT", "USD1USDT",
-    "POLYXUSDT",
+    "POLYXUSDT", "TRUUSDT",
 }
 
 # ─── Minimum 24h quote volume to qualify (reduces from 50 → 15 high-liquid coins) ─
@@ -103,98 +103,201 @@ def _save_rotation_state(state):
     except Exception as e:
         logger.error("Failed to save rotation state: %s", e)
 
-def get_hottest_segments(segment_limit=2):
+def get_hottest_segments(segment_limit=2, blocked_segments=None):
     """
-    Evaluate the pulse/momentum of all crypto segments via the 3-Pillar Institutional method:
-    Pillar 1: Volume-Weighted Relative Return (VW-RR)
-    Pillar 2: Benchmark Alpha (vs BTC)
-    Pillar 3: Participation Breadth
-    
-    Returns the top 'segment_limit' segments.
+    Evaluate segment momentum using cycle-matched timeframes (NOT lagged 24h).
+
+    Scoring (matched to 15-min execution cycle):
+      Pillar 1 — 4h candle return (50%): recent sector momentum, 1-2 session lag max
+      Pillar 2 — 1h breadth (50%): are coins *still* participating RIGHT NOW?
+
+    Ranked by absolute blended score → both hot longs and hot shorts surface.
+    Direction (LONG/SHORT) is decided downstream by HMM + Athena. # Falls back to 24h ticker return if kline fetch fails for a coin.
     """
+    if blocked_segments is None:
+        blocked_segments = set()
+    # ── Fetch live ticker for volume weighting (cached 60s) ─────────────────
     try:
-        client = _get_binance_client()
-        tickers = client.get_ticker()
+        tickers = get_cached_ticker()
         ticker_map = {t["symbol"]: t for t in tickers}
     except Exception as e:
         logger.error("Failed to fetch tickers for segment heatmap: %s", e)
         return list(config.CRYPTO_SEGMENTS.keys())[:segment_limit]
 
-    # Get Benchmark (BTC) 24h Return
-    btc_return = 0.0
-    if "BTCUSDT" in ticker_map:
+    # ── Fetch 4h and 1h klines for each coin (cached Binance client) ──────────
+    # One pass over all unique coins across all segments
+    all_coins = list({c for coins in config.CRYPTO_SEGMENTS.values() for c in coins})
+    coin_4h = {}   # symbol → % return of last completed 4h candle
+    coin_1h = {}   # symbol → % return of last completed 1h candle
+
+    for symbol in all_coins:
         try:
-            btc_return = float(ticker_map["BTCUSDT"]["priceChangePercent"])
-        except:
+            df4 = fetch_klines(symbol, "4h", limit=3)
+            if df4 is not None and len(df4) >= 3:
+                c0 = float(df4["close"].iloc[-3])
+                c1 = float(df4["close"].iloc[-2])   # completed candle
+                coin_4h[symbol] = (c1 - c0) / c0 * 100 if c0 else 0.0
+        except Exception:
+            pass
+        try:
+            df1 = fetch_klines(symbol, "1h", limit=3)
+            if df1 is not None and len(df1) >= 3:
+                c0 = float(df1["close"].iloc[-3])
+                c1 = float(df1["close"].iloc[-2])   # completed candle
+                coin_1h[symbol] = (c1 - c0) / c0 * 100 if c0 else 0.0
+        except Exception:
             pass
 
     segment_data = []
     for segment, coins in config.CRYPTO_SEGMENTS.items():
+        is_cooldown = segment in blocked_segments
+            
         valid_coins = []
         for symbol in coins:
             t = ticker_map.get(symbol)
-            if t:
-                try:
-                    change = float(t["priceChangePercent"])
-                    volume = float(t.get("quoteVolume", 0))
-                    valid_coins.append({"symbol": symbol, "change": change, "volume": volume})
-                except (ValueError, TypeError):
-                    pass
-        
+            if not t:
+                continue
+            try:
+                volume = float(t.get("quoteVolume", 0))
+                # 4h return: kline preferred, fallback to 24h ticker
+                ret_4h = coin_4h.get(symbol, float(t.get("priceChangePercent", 0)))
+                ret_1h = coin_1h.get(symbol, 0.0)
+                valid_coins.append({"symbol": symbol, "ret_4h": ret_4h,
+                                     "ret_1h": ret_1h, "volume": volume})
+            except (ValueError, TypeError):
+                pass
+
         if not valid_coins:
             continue
 
         total_vol = sum(c["volume"] for c in valid_coins)
-        
-        # Pillar 1: VW-RR (Volume-Weighted Relative Return)
-        vw_rr = sum(c["change"] * (c["volume"] / total_vol) for c in valid_coins) if total_vol > 0 else 0.0
-        
-        # Pillar 2: Benchmark Alpha
-        alpha = vw_rr - btc_return
-        
-        # Pillar 3: Participation Breadth (% of coins participating in the direction of the segment)
-        if vw_rr >= 0:
-            participating = sum(1 for c in valid_coins if c["change"] > 0)
+
+        # Pillar 1: Volume-weighted 4h return
+        if total_vol > 0:
+            vw_4h = sum(c["ret_4h"] * (c["volume"] / total_vol) for c in valid_coins)
         else:
-            participating = sum(1 for c in valid_coins if c["change"] < 0)
-            
-        breadth_pct = (participating / len(valid_coins)) * 100 if valid_coins else 0.0
-        
-        # Composite Score: VW-RR absolute magnitude scaled by breadth
-        # Example: A 10% move with 20% breadth is weak. A 5% move with 100% breadth is strong.
-        composite_score = vw_rr * (breadth_pct / 100.0)
+            vw_4h = sum(c["ret_4h"] for c in valid_coins) / len(valid_coins)
+
+        # Pillar 2: 1h participation breadth (% moving in same direction as segment)
+        direction = 1 if vw_4h >= 0 else -1
+        participating = sum(
+            1 for c in valid_coins
+            if (direction > 0 and c["ret_1h"] > 0) or (direction < 0 and c["ret_1h"] < 0)
+        )
+        breadth_1h = (participating / len(valid_coins)) * 100 if valid_coins else 0.0
+
+        # Blended score: 50% raw momentum + 50% breadth-attenuated momentum
+        blended = 0.5 * vw_4h + 0.5 * (vw_4h * breadth_1h / 100.0)
 
         segment_data.append({
-            "segment": segment,
-            "vw_rr": round(vw_rr, 2),
-            "btc_alpha": round(alpha, 2),
-            "breadth_pct": round(breadth_pct, 1),
-            "composite_score": round(composite_score, 2),
-            "is_positive": composite_score >= 0,
-            "abs_score": abs(composite_score)
+            "segment":       segment,
+            "vw_4h":         round(vw_4h, 2),
+            "breadth_1h":    round(breadth_1h, 1),
+            "blended_score": round(blended, 2),
+            "abs_score":     abs(blended),
+            "direction":     "LONG" if blended >= 0 else "SHORT",
+            "is_cooldown":   is_cooldown
         })
-        
-    # Rank by hottest absolute composite score (fastest movers)
+
+    # Sort by hottest absolute score — direction agnostic
     segment_data.sort(key=lambda x: x["abs_score"], reverse=True)
-    
-    # Save the heatmap to disk for the dashboard to read
+
+    # Save heatmap JSON for dashboard
     try:
         heatmap_file = os.path.join(config.DATA_DIR, "segment_heatmap.json")
         with open(heatmap_file, "w") as f:
             json.dump({
                 "timestamp": datetime.utcnow().isoformat() + "Z",
-                "btc_24h": round(btc_return, 2),
-                "segments": segment_data
+                "scoring":   "4h_return(50pct)+1h_breadth(50pct)",
+                "segments":  segment_data,
             }, f, indent=2)
     except Exception as e:
         logger.error("Failed to save segment heatmap: %s", e)
-    
-    logger.info("🔥 Institutional Segment Heatmap (Composite):")
+
+    logger.info("🔥 Segment Heatmap [4h+1h blended]:")
     for i, seg in enumerate(segment_data):
-        logger.info("   #%d %-8s : VW-RR %+.2f%% | Alpha %+.2f%% | Breadth %.0f%% -> Score: %.2f", 
-                    i+1, seg["segment"], seg["vw_rr"], seg["btc_alpha"], seg["breadth_pct"], seg["composite_score"])
+        _cd_flag = " [COOLDOWN]" if seg.get("is_cooldown") else ""
+        logger.info(
+            "   #%d %-10s : 4h=%+.2f%% | 1h_breadth=%.0f%% | Score=%+.2f [%s]%s",
+            i + 1, seg["segment"], seg["vw_4h"], seg["breadth_1h"],
+            seg["blended_score"], seg["direction"], _cd_flag
+        )
+
+    # Filter out cooldown segments for the HMM engine pool
+    active_segments = [s["segment"] for s in segment_data if not s.get("is_cooldown")]
+    
+    top_active = []
+    if "L1" in active_segments:
+        top_active.append("L1")
+        active_segments.remove("L1")
         
-    return [seg["segment"] for seg in segment_data[:segment_limit]]
+    remaining_limit = max(0, segment_limit - len(top_active))
+    top_active.extend(active_segments[:remaining_limit])
+    
+    logger.info("🎯 Forwarding top %d UNBLOCKED segments to HMM: %s", len(top_active), ", ".join(top_active))
+    return top_active
+
+
+
+def _get_btc_structure_signals() -> tuple[str, float]:
+    """
+    Two-signal structural confirmation for market mode detection — BTC only.
+
+    Signal 1 — 4h market structure ("bullish" / "bearish" / "neutral")
+      Compares the last two completed 4h candle HIGHS.
+      Higher-high  → swing structure intact on the bull side.
+      Lower-high   → structural breakdown beginning (catches swing highs
+                     and fake-breakout failures 1–2 candles before the
+                     24h return turns negative).
+      Equal / flat → neutral (treated as non-confirming).
+
+    Signal 2 — 1h BTC momentum (%)
+      Net return of the last completed 1h candle.
+      Fast intraday gate — flips within one engine cycle of a reversal.
+
+    Uses only 2 API calls (both BTCUSDT) regardless of how many segments
+    are configured. Falls back to ("neutral", 0.0) on any fetch failure
+    so the caller degrades to MIXED mode gracefully.
+    """
+    from data_pipeline import fetch_klines
+
+    tf_4h = getattr(config, "SEGMENT_MTF_4H_TF", "4h")
+    tf_1h = getattr(config, "SEGMENT_MTF_1H_TF", "1h")
+    sym   = config.PRIMARY_SYMBOL  # BTCUSDT
+
+    # ── Signal 1: 4h candle-high structure ───────────────────────────────────
+    btc_4h_structure = "neutral"
+    try:
+        df4 = fetch_klines(sym, tf_4h, limit=4)   # need at least 2 completed candles
+        if df4 is not None and len(df4) >= 3:
+            # iloc[-1] is the in-progress candle; use [-2] and [-3] as completed
+            cur_high  = float(df4["high"].iloc[-2])
+            prev_high = float(df4["high"].iloc[-3])
+            if cur_high > prev_high:
+                btc_4h_structure = "bullish"   # higher-high → swing trend intact
+            elif cur_high < prev_high:
+                btc_4h_structure = "bearish"   # lower-high  → structural breakdown
+            # else equal → stays "neutral"
+    except Exception as exc:
+        logger.debug("MTF 4h structure fetch failed: %s", exc)
+
+    # ── Signal 2: 1h BTC momentum ────────────────────────────────────────────
+    btc_1h_return = 0.0
+    try:
+        df1 = fetch_klines(sym, tf_1h, limit=3)
+        if df1 is not None and len(df1) >= 2:
+            btc_1h_return = (
+                (float(df1["close"].iloc[-1]) - float(df1["close"].iloc[-2]))
+                / float(df1["close"].iloc[-2]) * 100
+            )
+    except Exception as exc:
+        logger.debug("MTF 1h momentum fetch failed: %s", exc)
+
+    logger.info(
+        "📡 BTC structure signals → 4h_structure=%s | 1h_return=%.3f%%",
+        btc_4h_structure, btc_1h_return,
+    )
+    return btc_4h_structure, btc_1h_return
 
 
 def get_segment_pools_for_regime(short_n=None, long_n=None):
@@ -227,10 +330,9 @@ def get_segment_pools_for_regime(short_n=None, long_n=None):
     bearish_threshold = getattr(config, "SEGMENT_BEARISH_THRESHOLD", -2.0)
     bullish_threshold = getattr(config, "SEGMENT_BULLISH_THRESHOLD",  1.0)
 
-    # ── Fetch tickers (single API call, shared with get_hottest_segments) ──
+    # ── Fetch tickers (cached 60s, shared with get_hottest_segments) ──
     try:
-        client = _get_binance_client()
-        tickers = client.get_ticker()
+        tickers = get_cached_ticker()
         ticker_map = {t["symbol"]: t for t in tickers}
     except Exception as e:
         logger.error("Segment pool fetch failed: %s — defaulting to MIXED mode (all segs)", e)
@@ -275,18 +377,50 @@ def get_segment_pools_for_regime(short_n=None, long_n=None):
         all_segs = list(config.CRYPTO_SEGMENTS.keys())
         return "MIXED", all_segs[:short_n], all_segs[-long_n:]
 
-    # ── Market mode detection ──────────────────────────────────────────────
+    # ── 24h Frame: composite score across all segments ─────────────────────
     scores = [s["composite_score"] for s in segment_data]
     avg_score = sum(scores) / len(scores)
     positive_count = sum(1 for s in scores if s > 0)
     bullish_breadth = positive_count / len(scores)  # fraction of green segments
 
-    if avg_score < bearish_threshold and bullish_breadth < 0.25:
-        market_mode = "BEARISH"
-    elif avg_score > bullish_threshold and bullish_breadth > 0.75:
-        market_mode = "BULLISH"
+    # ── 24h signal (same thresholds as before) ─────────────────────────────
+    tf24_bullish = avg_score > bullish_threshold and bullish_breadth > 0.75
+    tf24_bearish = avg_score < bearish_threshold and bullish_breadth < 0.25
+
+    # ── Multi-TF confirmation: BTC structure (4h) + momentum (1h) ────────────
+    # BULLISH locked only when: 24h bullish AND 4h BTC making higher-highs AND 1h positive
+    # BEARISH locked only when: 24h bearish AND 4h BTC making lower-highs  AND 1h negative
+    # Neutral 4h structure or disagreement on any frame → MIXED (no forced lock)
+    mtf_enabled = getattr(config, "SEGMENT_MTF_ENABLED", True)
+    if mtf_enabled:
+        btc_4h_structure, btc_1h_return = _get_btc_structure_signals()
+
+        if tf24_bullish and btc_4h_structure == "bullish" and btc_1h_return > 0:
+            market_mode = "BULLISH"
+        elif tf24_bearish and btc_4h_structure == "bearish" and btc_1h_return < 0:
+            market_mode = "BEARISH"
+        else:
+            market_mode = "MIXED"   # any frame disagrees → no forced directional lock
+
+        logger.info(
+            "📊 Market Mode: %s | 24h avg=%.2f breadth=%.0f%% | "
+            "4h structure=%s | btc_1h=%.3f%%",
+            market_mode, avg_score, bullish_breadth * 100,
+            btc_4h_structure, btc_1h_return,
+        )
     else:
-        market_mode = "MIXED"
+        # Legacy single-frame mode (SEGMENT_MTF_ENABLED = False)
+        if tf24_bullish:
+            market_mode = "BULLISH"
+        elif tf24_bearish:
+            market_mode = "BEARISH"
+        else:
+            market_mode = "MIXED"
+
+        logger.info(
+            "📊 Market Mode (legacy): %s (avg_score=%.2f, green_breadth=%.0f%%)",
+            market_mode, avg_score, bullish_breadth * 100,
+        )
 
     # ── Build directional pools ────────────────────────────────────────────
     sorted_asc  = sorted(segment_data, key=lambda s: s["composite_score"])        # worst first
@@ -295,49 +429,49 @@ def get_segment_pools_for_regime(short_n=None, long_n=None):
     short_pool = [s["segment"] for s in sorted_asc[:short_n]]  if market_mode != "BULLISH" else []
     long_pool  = [s["segment"] for s in sorted_desc[:long_n]]  if market_mode != "BEARISH" else []
 
-    logger.info(
-        "📊 Market Mode: %s (avg_score=%.2f, green_breadth=%.0f%%) | "
-        "SHORT pool: %s | LONG pool: %s",
-        market_mode, avg_score, bullish_breadth * 100,
-        short_pool or "none", long_pool or "none",
-    )
+    logger.info("   ↳ SHORT pool: %s | LONG pool: %s",
+                short_pool or "none", long_pool or "none")
     return market_mode, short_pool, long_pool
 
 
 
-def get_active_bot_segment_pool(active_bots):
+def get_active_bot_segment_pool(active_bots, blocked_segments=None):
     """
     Builds the coin scan pool based on the segment_filter of all active bots.
-    If any bot has segment_filter == "ALL", or if no bots are registered,
-    it dynamically fetches the Top 2 hottest segments (and writes heatmap JSON).
-    For all other bots, it appends the coins from their specific mapped segments.
+    If USE_SEGMENT_FILTER=True: ONLY use the top-N hottest segments (SEGMENT_SCAN_LIMIT).
+      Individual bot segment_filter assignments are ignored for pool sizing —
+      the per-coin direction gate in main.py handles LONG/SHORT direction per bot.
+    If USE_SEGMENT_FILTER=False: all bot segments are merged (legacy behaviour).
     """
     logger.info("🔍 Compiling segment scan pool for %d active bots...", len(active_bots))
 
-    target_segments = set()
-    needs_dynamic_all = False
+    segment_limit = getattr(config, "SEGMENT_SCAN_LIMIT", 2)
+    use_segment_filter = getattr(config, "USE_SEGMENT_FILTER", True)
 
-    if not active_bots:
-        # No bots registered yet — treat as 'ALL' mode so we still scan segments
-        # and write the heatmap for the dashboard
-        needs_dynamic_all = True
-        logger.info("⚡ No active bots registered — falling back to ALL/dynamic segment mode")
+    # ── FAST PATH: USE_SEGMENT_FILTER=True ───────────────────────────────────
+    # Always use ONLY top-N dynamic segments. Ignore individual bot segment_filter settings
+    # so we don't merge all 10 segments → 74 coins when all bots are default 'ALL'.
+    if use_segment_filter:
+        top_segments = get_hottest_segments(segment_limit, blocked_segments)  # writes heatmap JSON
+        logger.info("🎯 Segment filter ON — pool capped to top %d non-blocked segments: %s",
+                    segment_limit, ", ".join(top_segments))
+        target_segments = set(top_segments)
     else:
-        for bot in active_bots:
-            seg = bot.get("segment_filter", "ALL")
-            if seg == "ALL":
-                needs_dynamic_all = True
-            elif seg in config.CRYPTO_SEGMENTS:
-                target_segments.add(seg)
+        # Segment filter disabled — merge all individual bot segment assignments
+        target_segments = set()
+        if not active_bots:
+            get_hottest_segments(segment_limit, blocked_segments)  # still write heatmap JSON
+            target_segments = set(config.CRYPTO_SEGMENTS.keys())
+        else:
+            for bot in active_bots:
+                seg = bot.get("segment_filter", "ALL")
+                if seg == "ALL":
+                    target_segments = set(config.CRYPTO_SEGMENTS.keys())
+                    break
+                elif seg in config.CRYPTO_SEGMENTS:
+                    target_segments.add(seg)
+        logger.info("🔓 Segment filter OFF — scanning all %d segments", len(target_segments))
 
-    if needs_dynamic_all:
-        segment_limit = getattr(config, "SEGMENT_SCAN_LIMIT", 2)
-        top_segments = get_hottest_segments(segment_limit)  # ← also writes heatmap JSON
-        logger.info("🎯 Dynamic segment selection — Top %d: %s", segment_limit, ", ".join(top_segments))
-        for t_seg in top_segments:
-            target_segments.add(t_seg)
-
-    # Compile the final unique list of coins from exactly these target segments
     candidates = set()
     for seg in target_segments:
         coins = config.CRYPTO_SEGMENTS.get(seg, [])
@@ -391,8 +525,7 @@ def get_top_segment_candidates():
 def get_top_coins_by_volume(limit=50):
     """Legacy retail backward-compatibility function."""
     try:
-        client = _get_binance_client()
-        tickers = client.get_ticker()
+        tickers = list(get_cached_ticker())  # copy so sort doesn't mutate cache
         tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
         exclusions = get_all_exclusions()
         valid = [t["symbol"] for t in tickers if "USDT" in t["symbol"] and t["symbol"] not in exclusions and "UP" not in t["symbol"] and "DOWN" not in t["symbol"]]
@@ -402,9 +535,8 @@ def get_top_coins_by_volume(limit=50):
 
 def _get_segment_coins_binance(segment_coins, limit=5):
     """Fetch top coins for a specific segment from Binance by 24h volume."""
-    client = _get_binance_client()
     try:
-        tickers = client.get_ticker()
+        tickers = get_cached_ticker()
     except Exception as e:
         logger.error("Failed to fetch Binance tickers: %s", e)
         return [config.PRIMARY_SYMBOL]

@@ -6,7 +6,10 @@ Uses the HTTP API directly (no external telegram library needed).
 import json
 import logging
 import os
+import queue
+import re
 import threading
+import time
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -24,7 +27,7 @@ _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 
 def _read_env_val(key, fallback=""):
-    """Read a single value directly from .env file (bypasses cached os.environ)."""
+    """Read a value from .env file first, then fall back to os.environ."""
     try:
         with open(_ENV_PATH, "r") as f:
             for line in f:
@@ -33,7 +36,8 @@ def _read_env_val(key, fallback=""):
                     return line[len(key) + 1:].strip()
     except Exception:
         pass
-    return fallback
+    # Fall back to os.environ (Railway sets env vars directly, no .env file)
+    return os.environ.get(key, fallback)
 
 
 def _get_live_config():
@@ -48,7 +52,12 @@ def _get_live_config():
 def _send_request(method, params=None):
     """Send a request to the Telegram Bot API."""
     cfg = _get_live_config()
-    if not cfg["enabled"] or not cfg["token"]:
+    if not cfg["enabled"]:
+        logger.warning("[Telegram] TELEGRAM_ENABLED is not 'true' — message dropped (method=%s). "
+                       "Set TELEGRAM_ENABLED=true in Railway env vars.", method)
+        return None
+    if not cfg["token"]:
+        logger.warning("[Telegram] TELEGRAM_BOT_TOKEN is empty — message dropped (method=%s).", method)
         return None
 
     url = BASE_URL.format(token=cfg["token"], method=method)
@@ -79,7 +88,8 @@ def send_message(text, parse_mode="HTML", silent=False):
     """
     cfg = _get_live_config()
     if not cfg["chat_id"]:
-        logger.debug("Telegram chat_id not set, skipping message.")
+        logger.warning("[Telegram] TELEGRAM_CHAT_ID is empty — message dropped. "
+                       "Set TELEGRAM_CHAT_ID in Railway env vars.")
         return None
 
     return _send_request("sendMessage", {
@@ -90,10 +100,57 @@ def send_message(text, parse_mode="HTML", silent=False):
     })
 
 
+def log_startup_config():
+    """Log Telegram config at startup so prod issues are visible immediately."""
+    cfg = _get_live_config()
+    token_preview = (cfg["token"][:8] + "...") if cfg["token"] else "(not set)"
+    logger.info(
+        "[Telegram] Config loaded — enabled=%s | token=%s | chat_id=%s",
+        cfg["enabled"], token_preview, cfg["chat_id"] or "(not set)"
+    )
+    if not cfg["enabled"]:
+        logger.warning("[Telegram] TELEGRAM_ENABLED is not true — all notifications are OFF. "
+                       "Set TELEGRAM_ENABLED=true in Railway environment variables.")
+    elif not cfg["token"] or not cfg["chat_id"]:
+        logger.warning("[Telegram] token or chat_id missing — messages will be dropped.")
+
+
+# ─── Rate-Limited Send Queue ─────────────────────────────────────────────────
+# Telegram allows ~30 msg/s globally but recommends ≤1/s per chat to avoid 429s.
+# All async sends go through this queue; background worker drains at 1 msg/sec.
+
+_send_queue: queue.Queue = queue.Queue(maxsize=200)
+
+
+def _queue_worker():
+    """Background thread: drain _send_queue at max 1 message per second."""
+    while True:
+        try:
+            text, kwargs = _send_queue.get(timeout=5)
+            try:
+                send_message(text, **kwargs)
+            except Exception as e:
+                logger.error("[Telegram] Queue worker send error: %s", e)
+            finally:
+                _send_queue.task_done()
+            time.sleep(1)  # rate-limit: 1 msg/sec
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.error("[Telegram] Queue worker fatal error: %s", e)
+
+
+_worker_thread = threading.Thread(target=_queue_worker, daemon=True, name="TelegramQueue")
+_worker_thread.start()
+
+
 def send_message_async(text, **kwargs):
-    """Non-blocking version — sends in a background thread."""
-    t = threading.Thread(target=send_message, args=(text,), kwargs=kwargs, daemon=True)
-    t.start()
+    """Queue a message for rate-limited delivery. Never drops silently."""
+    try:
+        _send_queue.put_nowait((text, kwargs))
+    except queue.Full:
+        logger.error("[Telegram] Send queue full (%d items) — message dropped: %.60s…",
+                     _send_queue.qsize(), text)
 
 
 # ─── Notification Formatters ─────────────────────────────────────────────────────
@@ -118,25 +175,145 @@ def notify_batch_entries(trades):
 
     lines = [header, "━━━━━━━━━━━━━━━━━━"]
 
-    for i, trade in enumerate(trades, 1):
-        emoji = "🟢" if trade.get("position") == "LONG" else "🔴"
+    grouped = {}
+    for trade in trades:
         sym = trade.get("symbol", "?")
         pos = trade.get("position", "?")
-        regime = trade.get("regime", "?")
-        conf = trade.get("confidence", 0)
+        if pos == "?":
+            side = trade.get("side", "").upper()
+            pos = "LONG" if side in ("BUY", "LONG") else "SHORT" if side in ("SELL", "SHORT") else "?"
+            
         lev = trade.get("leverage", 1)
-        entry = trade.get("entry_price", 0)
-        sl = trade.get("stop_loss", 0)
-        tp = trade.get("take_profit", 0)
+        regime = trade.get("regime", "?")
+        
+        key = (sym, pos, lev, regime)
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(trade)
+
+    for (sym, pos, lev, regime), group in grouped.items():
+        rep_trade = group[0]
+        count_in_group = len(group)
+        
+        emoji = "🟢" if pos == "LONG" else "🔴"
+        conf = rep_trade.get("confidence", 0)
+        entry = rep_trade.get("entry_price", 0)
+        sl = rep_trade.get("stop_loss", 0)
+        tp = rep_trade.get("take_profit", 0)
+        
+        if count_in_group > 1:
+            users = set(t.get("user_id") for t in group if t.get("user_id"))
+            bots = set(t.get("bot_id") for t in group if t.get("bot_id"))
+            u_str = f"{len(users)} user{'s' if len(users) != 1 else ''}" if users else f"{count_in_group} users"
+            b_str = f"{len(bots)} bot{'s' if len(bots) != 1 else ''}" if bots else f"{count_in_group} bots"
+            deployed_msg = f"\n   👥 <i>Deployed across {u_str} · {b_str}</i>"
+        else:
+            bot_name = rep_trade.get("bot_name")
+            deployed_msg = f"\n   🤖 <i>{bot_name}</i>" if bot_name else ""
+
+        reasoning = rep_trade.get("athena_reasoning", "")
+        short_reason = ""
+        if reasoning and not reasoning.startswith("Auto-approve"):
+            sentences = re.split(r'(?<=[.!?])\s+', reasoning.strip())
+            short_reason = " ".join(sentences[:2]).strip()
+            if len(short_reason) > 400:
+                short_reason = short_reason[:397] + "…"
+        
+        athena_block = f"\n\n💡 <i>{short_reason}</i>\n" if short_reason else "\n"
 
         lines.append(
-            f"{emoji} <b>{sym}</b> {pos} {lev}× | {regime} {conf:.0%}\n"
-            f"   📈 <code>{entry:.6f}</code>  🛑 <code>{sl:.6f}</code>  🎯 <code>{tp:.6f}</code>"
+            f"{emoji} <b>{sym}</b> {pos} {lev}× | {regime} {conf:.0%}{deployed_msg}\n"
+            f"   📈 <code>{entry:.6f}</code>  🛑 <code>{sl:.6f}</code>  🎯 <code>{tp:.6f}</code>{athena_block}"
         )
 
-    lines.append(f"\n💵 Capital: $100 each  |  🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+    risk_manager_block = (
+        f"🛡 <b>Risk Manager</b>: Step Trailing SL\n"
+        f"   +15% → lock +4% (Breakeven)\n"
+        f"   +25% → +10% · +35% → +15%\n"
+        f"   +45% → +25% · +60% → +40%\n"
+    )
+    lines.append(risk_manager_block)
+    lines.append(f"💵 Capital: $100 per user  |  🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}")
 
     msg = "\n".join(lines)
+    send_message_async(msg)
+
+
+def notify_athena_signal(sym, side, conviction_pct, entry_price, sl, tp, segment, reasoning, bot_name="", leverage=0):
+    """
+    Fire when Athena approves a coin — before the trade actually deploys.
+    This is the 'signal' alert; notify_batch_entries fires on confirmed deploy.
+    """
+    if not _read_env_val("TELEGRAM_NOTIFY_TRADES", "true").lower() == "true":
+        return
+
+    emoji = "🟢" if side in ("BUY", "LONG") else "🔴"
+    dir_label = "LONG ↑" if side in ("BUY", "LONG") else "SHORT ↓"
+
+    # Split on true sentence boundaries (". " not ".") to avoid cutting at decimal points.
+    # e.g. "confidence of 0.82" would wrongly split → "confidence of 0" with the old method.
+    sentences = re.split(r'(?<=[.!?])\s+', (reasoning or "").strip())
+    short_reason = " ".join(sentences[:2]).strip()  # up to 2 full sentences
+    if len(short_reason) > 400:
+        short_reason = short_reason[:397] + "…"
+
+    # Format prices — use 6dp for small prices, 2dp for large
+    def fmt(p):
+        if p and p > 0:
+            return f"{p:.6f}" if p < 10 else f"{p:.2f}"
+        return "N/A"
+
+    sl_pct = abs((sl - entry_price) / entry_price * 100) if entry_price and sl else 0
+    tp_pct = abs((tp - entry_price) / entry_price * 100) if entry_price and tp else 0
+    lev_str = f" · {leverage}×" if leverage else ""
+    coin_name = sym.replace('USDT', '')
+
+    msg = (
+        f"🏛️ <b>ATHENA SIGNAL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{coin_name}</b>{lev_str} · {dir_label} · <b>{conviction_pct:.0f}%</b>\n"
+        f"📂 Segment: {segment}\n"
+        f"\n"
+        f"📍 Entry:  <code>{fmt(entry_price)}</code>\n"
+        f"🛑 SL:     <code>{fmt(sl)}</code>  <i>(-{sl_pct:.1f}%)</i>\n"
+        f"🎯 TP:     <code>{fmt(tp)}</code>  <i>(+{tp_pct:.1f}%)</i>\n"
+        f"\n"
+        f"💡 <i>{short_reason}</i>\n"
+        f"\n"
+        f"🛡 <b>Risk Manager</b>: Step Trailing SL\n"
+        f"   +15% → lock +4% (Breakeven)\n"
+        f"   +25% → +10% · +35% → +15%\n"
+        f"   +45% → +25% · +60% → +40%\n"
+        f"\n"
+        f"{'🤖 ' + bot_name + '  ' if bot_name else ''}"
+        f"🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    )
+    send_message_async(msg)
+
+
+def notify_athena_veto(sym, side, conviction_pct, reasoning, segment):
+    """Fire when Athena vetoes a coin — trade blocked."""
+    if not _read_env_val("TELEGRAM_NOTIFY_TRADES", "true").lower() == "true":
+        return
+
+    emoji = "🟢" if side in ("BUY", "LONG") else "🔴"
+    dir_label = "LONG ↑" if side in ("BUY", "LONG") else "SHORT ↓"
+    # Use proper sentence boundary split — not '.' which hits decimal points
+    sentences = re.split(r'(?<=[\.!?])\s+', (reasoning or "").strip())
+    short_reason = " ".join(sentences[:2]).strip()
+    if len(short_reason) > 300:
+        short_reason = short_reason[:297] + "…"
+    coin_name = sym.replace('USDT', '')
+
+    msg = (
+        f"🚫 <b>ATHENA VETO</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{emoji} <b>{coin_name}</b> · {dir_label} · <b>{conviction_pct:.0f}% conf</b>\n"
+        f"📂 Segment: {segment}\n"
+        f"\n"
+        f"❌ <i>{short_reason}</i>\n"
+        f"🕐 {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+    )
     send_message_async(msg)
 
 

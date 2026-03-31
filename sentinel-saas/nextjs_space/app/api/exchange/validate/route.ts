@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth-options';
-import prisma from '@/lib/prisma';
 
 export const dynamic = 'force-dynamic';
 
@@ -62,6 +61,7 @@ async function validateBinance(apiKey: string, apiSecret: string) {
                 exchange: 'binance',
                 balance: parseFloat(data.totalWalletBalance || '0'),
                 availableBalance: parseFloat(data.availableBalance || '0'),
+                email: null,
             });
         } else {
             const err = await res.json().catch(() => ({}));
@@ -104,6 +104,8 @@ async function validateCoinDCX(apiKey: string, apiSecret: string) {
                 valid: true,
                 exchange: 'coindcx',
                 email: data.email,
+                balance: null,
+                availableBalance: null,
             });
         } else {
             return NextResponse.json({

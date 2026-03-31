@@ -5,6 +5,30 @@ import { getActiveBotSession } from '@/lib/bot-session';
 const _lastSyncTime: Record<string, number> = {};
 const SYNC_THROTTLE_MS = 5_000;   // 5s throttle — safe at 25+ users (200 bots). 1s would cause ~200 upserts/sec on Railway.
 
+// ── Static coin exclusion list — mirrors config.py COIN_EXCLUDE ──────────────
+// Trades for these symbols are NEVER synced into Prisma, even if the engine
+// still has them in its in-memory tradebook from before the exclusion was added.
+const COIN_EXCLUDE = new Set([
+    'EURUSDT', 'WBTCUSDT', 'USDCUSDT', 'TUSDUSDT', 'BUSDUSDT',
+    'USTUSDT', 'DAIUSDT', 'FDUSDUSDT', 'CVCUSDT', 'USD1USDT',
+    'POLYXUSDT', 'TRUUSDT', 'QNTUSDT',
+]);
+
+// Used to prevent cross-segment trade pollution (e.g. BTC trade written to Gaming bot).
+// When BotConfig.segment === 'ALL' (or unknown), all coins are allowed.
+const SEGMENT_POOLS: Record<string, string[]> = {
+    L1:      ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','AVAXUSDT','SUIUSDT','XRPUSDT','APTUSDT','ETCUSDT','ADAUSDT','DOTUSDT','NEARUSDT','TRXUSDT','BCHUSDT','TONUSDT','ICPUSDT'],
+    L2:      ['ARBUSDT','OPUSDT','POLUSDT','STRKUSDT','IMXUSDT','RONINUSDT','ZKUSDT','MANTAUSDT','METISUSDT','AXLUSDT'],
+    DeFi:    ['UNIUSDT','AAVEUSDT','CRVUSDT','JUPUSDT','RUNEUSDT','PENDLEUSDT','LINKUSDT','LDOUSDT','GMXUSDT','ENAUSDT','SUSHIUSDT','COMPUSDT','SNXUSDT','CAKEUSDT','GRTUSDT'],
+    AI:      ['TAOUSDT','FETUSDT','INJUSDT','WLDUSDT','AKTUSDT','RENDERUSDT','ARKMUSDT'],
+    Meme:    ['DOGEUSDT','SHIBUSDT','PEPEUSDT','WIFUSDT','BONKUSDT','NOTUSDT','MANAUSDT'],
+    RWA:     ['ONDOUSDT','POLYXUSDT','TRUUSDT','RSRUSDT'],
+    Gaming:  ['AXSUSDT','SANDUSDT','PIXELUSDT','IOTXUSDT','GALAUSDT','ENJUSDT','YGGUSDT','GLMUSDT'],
+    DePIN:   ['FILUSDT','ARUSDT','IOUSDT','JTOUSDT'],
+    Modular: ['TIAUSDT','DYMUSDT','STXUSDT','QNTUSDT','ALTUSDT','EIGENUSDT'],
+    Oracles: ['PYTHUSDT','TRBUSDT','API3USDT','HBARUSDT','BANDUSDT','DIAUSDT'],
+};
+
 /**
  * Sync engine trades into Prisma, scoped to a specific bot.
  * Only syncs trades whose entry_time >= bot.startedAt.
@@ -19,7 +43,8 @@ export async function syncEngineTrades(
     engineTrades: any[],
     botId: string,
     botStartedAt: Date | null,
-    userId?: string
+    userId?: string,
+    botSegment?: string           // e.g. 'L1', 'Gaming', 'ALL' — from BotConfig.segment
 ): Promise<number> {
     if (!engineTrades || engineTrades.length === 0) return 0;
 
@@ -56,6 +81,10 @@ export async function syncEngineTrades(
             const engineTradeId = t.trade_id || t.id;
             if (!engineTradeId) continue;
 
+            // ── Excluded coin guard ──────────────────────────────────────────
+            const tradeCoinRaw = (t.symbol || t.coin || '').toUpperCase();
+            if (COIN_EXCLUDE.has(tradeCoinRaw)) continue;
+
             const status = (t.status || 'active').toLowerCase();
             const side = (t.side || t.position || '').toLowerCase();
 
@@ -68,31 +97,21 @@ export async function syncEngineTrades(
                 if (!isNaN(d.getTime())) exitTime = d;
             }
 
-            // STRICT BOT ISOLATION: Only sync trades that belong to THIS bot.
-            // Check all_bot_ids first (multi-bot engine feature), then fallback to primary bot_id.
-            const allBotIds = Array.isArray(t.all_bot_ids) && t.all_bot_ids.length > 0 ? t.all_bot_ids : [];
-            const tradeBotId = (t.bot_id || '').trim();
-
-            if (allBotIds.length > 0) {
-                if (!allBotIds.includes(botId)) {
-                    continue;
-                }
+            // ── PRIMARY FILTER: bot_id ownership ─────────────────────────────────
+            // Engine stamps bot_id on every trade at deploy time (tradebook.py line 242).
+            // Only sync this trade to the bot that actually deployed it.
+            // If bot_id is missing (legacy trades before multi-bot), fall through to segment filter.
+            const tradeBotId = (t.bot_id || t.botId || '').trim();
+            if (tradeBotId) {
+                if (tradeBotId !== botId) continue;   // belongs to a different bot — skip
             } else {
-                if (tradeBotId && tradeBotId !== botId) {
-                    continue;
-                }
-                // Allow AUTO_SYNCED/orphaned trades (no bot_id) if user_id matches —
-                // happens when engine restarts and places trade before re-registration
-                if (!tradeBotId) {
-                    const tradeUserId = (t.user_id || '').trim();
-                    if (!tradeUserId || !userId || tradeUserId !== userId) {
-                        continue;
-                    }
-                    // falls through — associate this orphaned trade with the current bot
+                // ── FALLBACK: segment filter for legacy trades without bot_id ─────
+                if (botSegment && botSegment !== 'ALL') {
+                    const pool = SEGMENT_POOLS[botSegment] || [];
+                    const tradeCoin = (t.symbol || t.coin || '').toUpperCase();
+                    if (pool.length > 0 && !pool.includes(tradeCoin)) continue;
                 }
             }
-
-            const resolvedBotId = botId;
 
             // ── SL/TP Sanity Check (fixes engine-side cross-contamination bug) ──
             // Engine's tradebook.json has SL/TP AND atr_at_entry from wrong trades.
@@ -141,11 +160,11 @@ export async function syncEngineTrades(
             // Upsert: create if not exists, update PNL/status if exists
             await prisma.trade.upsert({
                 where: {
-                    id: `engine_${engineTradeId}_${resolvedBotId}`,
+                    id: `engine_${engineTradeId}_${botId}`,
                 },
                 create: {
-                    id: `engine_${engineTradeId}_${resolvedBotId}`,
-                    botId: resolvedBotId,
+                    id: `engine_${engineTradeId}_${botId}`,
+                    botId: botId,
                     coin: t.symbol || t.coin || '',
                     position: side === 'buy' || side === 'long' ? 'long' : 'short',
                     regime: t.regime || '',
@@ -165,24 +184,28 @@ export async function syncEngineTrades(
                     activePnl: t.unrealized_pnl || t.active_pnl || 0,
                     activePnlPercent: t.unrealized_pnl_pct || t.activePnlPercent || 0,
                     totalPnl: status === 'closed'
-                        ? (t.pnl || t.realized_pnl || t.total_pnl || 0)
-                        : 0,  // BUG-13: active trades have no realized PnL yet
-                    totalPnlPercent: t.pnl_pct || t.totalPnlPercent || 0,
+                        ? (t.realized_pnl || t.pnl || t.total_pnl || 0)
+                        : 0,  // Active trades start with 0 realized PnL (set on close)
+                    totalPnlPercent: status === 'closed' ? (t.realized_pnl_pct || t.pnl_pct || 0) : 0,
                     exitReason: t.exit_reason || t.exitReason || null,
                     exitPercent: t.exit_percent || null,
                     exchangeOrderId: String(engineTradeId),
                     entryTime,
                     exitTime,
-                    // Multi-target fields
-                    t1Price: t.targets?.t1 || null,
-                    t2Price: t.targets?.t2 || null,
-                    t3Price: t.targets?.t3 || null,
+                    // Multi-target fields (engine stores flat: t1_price, t2_price, t3_price)
+                    t1Price: t.t1_price || null,
+                    t2Price: t.t2_price || null,
+                    t3Price: t.t3_price || null,
                     t1Hit: t.t1_hit || false,
                     t2Hit: t.t2_hit || false,
                     trailingSl: rawTrailingSl,
                     trailingActive: t.trailing_active ?? false,
                     trailSlCount: t.trail_sl_count ?? 0,
                     steppedLockLevel: t.stepped_lock_level ?? -1,
+                    // Exit guard state — stamped every heartbeat by tradebook.py
+                    exitGuardActive: t.exit_guard_active ?? true,
+                    exitCheckAt:     t.exit_check_at ? new Date(t.exit_check_at) : null,
+                    exitCheckPrice:  t.exit_check_price ?? null,
                     sessionId: activeSession?.id ?? null,
                 },
                 update: {
@@ -193,10 +216,13 @@ export async function syncEngineTrades(
                     exitPrice: t.exit_price || t.exitPrice || null,
                     activePnl: t.unrealized_pnl || t.active_pnl || 0,
                     activePnlPercent: t.unrealized_pnl_pct || t.activePnlPercent || 0,
-                    totalPnl: status === 'closed'
-                        ? (t.pnl || t.realized_pnl || t.total_pnl || 0)
-                        : 0,  // BUG-13: active trades have no realized PnL yet
-                    totalPnlPercent: t.pnl_pct || t.totalPnlPercent || 0,
+                    // BUG-1 FIX: Only overwrite totalPnl when engine reports closed.
+                    // If active, leave Prisma value untouched (undefined = no-op) so a race
+                    // condition between close-tick and active-tick doesn't wipe realized PnL.
+                    ...(status === 'closed' ? {
+                        totalPnl: t.realized_pnl || t.pnl || t.total_pnl || 0,
+                        totalPnlPercent: t.realized_pnl_pct || t.pnl_pct || 0,
+                    } : {}),
                     exitReason: t.exit_reason || t.exitReason || null,
                     exitTime,
                     stopLoss: recalcSl,
@@ -208,6 +234,10 @@ export async function syncEngineTrades(
                     trailingActive: t.trailing_active ?? false,
                     trailSlCount: t.trail_sl_count ?? 0,
                     steppedLockLevel: t.stepped_lock_level ?? -1,
+                    // Exit guard state — update every heartbeat
+                    exitGuardActive: t.exit_guard_active ?? true,
+                    exitCheckAt:     t.exit_check_at ? new Date(t.exit_check_at) : null,
+                    exitCheckPrice:  t.exit_check_price ?? null,
                 },
             });
 
@@ -227,7 +257,8 @@ export async function syncEngineTrades(
 export async function getUserTrades(userId: string, statusFilter?: string, botId?: string, modeFilter?: string) {
     const trades = await prisma.trade.findMany({
         where: {
-            bot: { userId },
+            // Exclude trades from retired bots — retired data lives in Segment Performance panel only
+            bot: { userId, status: { not: 'retired' } },
             ...(botId ? { botId } : {}),
             ...(statusFilter ? { status: statusFilter.toLowerCase() } : {}),
             ...(modeFilter ? { mode: modeFilter.toLowerCase() } : {}),
@@ -238,7 +269,15 @@ export async function getUserTrades(userId: string, statusFilter?: string, botId
         },
     });
 
-    return trades.map(t => ({
+    return trades
+        .filter((t: any) => !COIN_EXCLUDE.has((t.coin || '').toUpperCase()))
+        // PnL sanity: active trades with |unrealizedPnl%| > 999 have garbage quantity data
+        .filter((t: any) => {
+            if (t.status !== 'active') return true; // always show closed trades
+            const pct = Math.abs(t.activePnlPercent || 0);
+            return pct <= 999;
+        })
+        .map(t => ({
         id: t.id,
         trade_id: t.exchangeOrderId || t.id,
         symbol: t.coin,
@@ -260,8 +299,12 @@ export async function getUserTrades(userId: string, statusFilter?: string, botId
         t2Hit: t.t2Hit,
         trailing_sl: t.trailingSl,
         trailing_active: t.trailingActive,
-        trail_sl_count: t.trailSlCount,        // ← was missing: step count for SL Step column
-        stepped_lock_level: t.steppedLockLevel, // ← was missing: which step index is active
+        trail_sl_count: t.trailSlCount,
+        stepped_lock_level: t.steppedLockLevel,
+        // Exit guard fields
+        exit_guard_active: t.exitGuardActive,
+        exit_check_at:     t.exitCheckAt?.toISOString() ?? null,
+        exit_check_price:  t.exitCheckPrice ?? null,
         status: t.status.toUpperCase(),
         unrealized_pnl: t.activePnl,
         unrealized_pnl_pct: t.activePnlPercent,
@@ -296,4 +339,144 @@ export async function clearUserTrades(userId: string): Promise<number> {
         },
     });
     return result.count;
+}
+
+// ─── Athena Decision Log Sync ───────────────────────────────────────────────
+
+// Throttle: max once per 60s globally (decisions don't change mid-cycle)
+let _lastAthenaSync = 0;
+const ATHENA_SYNC_THROTTLE_MS = 60_000;
+
+/**
+ * Sync Athena decisions from engine coin_states into AthenaDecisionLog.
+ * Called from bot-state GET poll. Deduplicates by cycle+symbol.
+ */
+export async function syncAthenaDecisions(
+    coinStates: Record<string, any>,
+    cycle: number,
+    engineTrades?: any[]
+): Promise<number> {
+    if (!coinStates || typeof coinStates !== 'object') return 0;
+
+    const now = Date.now();
+    if (now - _lastAthenaSync < ATHENA_SYNC_THROTTLE_MS) return 0;
+    _lastAthenaSync = now;
+
+    let synced = 0;
+
+    for (const [symbol, state] of Object.entries(coinStates)) {
+        const athena = state?.athena_state;
+        if (!athena || !athena.action) continue;
+
+        // Derive segment from bot_deploy_statuses or pool_status
+        const segment = state?.segment || state?.pool_segment || null;
+        const regime = (state?.regime || '').replace(/\(.*\)/, '').trim() || null;
+        const conviction = state?.conviction ?? state?.confidence ?? null;
+        const price = state?.price ?? null;
+
+        // Check deployment status
+        const deployStatuses = state?.bot_deploy_statuses || {};
+        const deployValues = Object.values(deployStatuses);
+        const deployed = deployValues.some((v: any) => String(v).includes('DEPLOYED'));
+        const deployReason = deployed
+            ? null
+            : deployValues.find((v: any) => String(v).includes('FILTERED') || String(v).includes('SKIP'))
+                ? String(deployValues.find((v: any) => String(v).includes('FILTERED') || String(v).includes('SKIP')))
+                : athena.action === 'VETO' ? 'Athena VETO' : null;
+
+        try {
+            // Upsert: unique by cycle + symbol
+            const existing = await prisma.athenaDecisionLog.findFirst({
+                where: { cycle, symbol },
+            });
+
+            if (existing) {
+                // Only update if data has changed (e.g., deployment status)
+                if (existing.deployed !== deployed || (!existing.tradeId && deployed)) {
+                    await prisma.athenaDecisionLog.update({
+                        where: { id: existing.id },
+                        data: {
+                            deployed,
+                            deployReason: deployReason || existing.deployReason,
+                        },
+                    });
+                }
+            } else {
+                await prisma.athenaDecisionLog.create({
+                    data: {
+                        cycle,
+                        symbol,
+                        segment,
+                        regime,
+                        conviction: conviction != null ? Number(conviction) : null,
+                        action: athena.action,
+                        side: athena.side || athena.athena_direction || null,
+                        confidence: athena.confidence != null ? Number(athena.confidence) : null,
+                        reasoning: athena.reasoning || null,
+                        riskFlags: Array.isArray(athena.risk_flags) ? JSON.stringify(athena.risk_flags) : null,
+                        model: athena.model || null,
+                        latencyMs: athena.latency_ms != null ? Number(athena.latency_ms) : null,
+                        suggestedSl: athena.suggested_sl && Number(athena.suggested_sl) > 0 ? Number(athena.suggested_sl) : null,
+                        suggestedTp: athena.suggested_tp && Number(athena.suggested_tp) > 0 ? Number(athena.suggested_tp) : null,
+                        entryPrice: price != null ? Number(price) : null,
+                        deployed,
+                        deployReason,
+                    },
+                });
+                synced++;
+            }
+        } catch (err) {
+            console.error(`[athena-sync] Failed for ${symbol} cycle ${cycle}:`, err);
+        }
+    }
+
+    // ── Backfill P&L from closed trades ──
+    try {
+        const unlinked = await prisma.athenaDecisionLog.findMany({
+            where: {
+                deployed: true,
+                tradeStatus: { not: 'CLOSED' },
+            },
+            take: 50,
+            orderBy: { timestamp: 'desc' },
+        });
+
+        for (const log of unlinked) {
+            // Find matching trade by symbol and approximate time
+            const trade = await prisma.trade.findFirst({
+                where: {
+                    coin: log.symbol,
+                    entryTime: { gte: new Date(log.timestamp.getTime() - 300000) }, // within 5 min
+                    ...(log.tradeId ? { id: log.tradeId } : {}),
+                },
+                orderBy: { entryTime: 'desc' },
+            });
+
+            if (!trade) continue;
+
+            const update: any = {};
+            if (!log.tradeId) update.tradeId = trade.id;
+
+            if (trade.status === 'closed') {
+                update.tradeStatus = 'CLOSED';
+                update.pnl = trade.totalPnl || 0;
+                update.pnlPct = trade.totalPnlPercent || 0;
+                update.exitPrice = trade.exitPrice || null;
+                update.closedAt = trade.exitTime || new Date();
+            } else if (!log.tradeStatus) {
+                update.tradeStatus = 'ACTIVE';
+            }
+
+            if (Object.keys(update).length > 0) {
+                await prisma.athenaDecisionLog.update({
+                    where: { id: log.id },
+                    data: update,
+                });
+            }
+        }
+    } catch (err) {
+        console.error('[athena-sync] P&L backfill error:', err);
+    }
+
+    return synced;
 }

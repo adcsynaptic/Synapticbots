@@ -37,6 +37,86 @@ _engine_bot = None
 _engine_crash_count = 0
 _engine_last_crash = None
 _engine_start_lock = threading.Lock()  # Prevents duplicate engine threads on startup
+_ENGINE_INITIALIZED = False            # Module-level guard: prevents re-entrant start_engine() calls
+
+# ─── PID Lock File ────────────────────────────────────────────────────
+# Prevents two engine processes running simultaneously.
+# On Railway overlapping deploys, old + new containers temporarily share
+# the same /app/data/ volume. The new container writes its PID here;
+# if the old container's PID file is still present AND the old process
+# is alive, the new engine defers startup for up to 45 seconds.
+ENGINE_PID_FILE = os.path.join(os.path.dirname(__file__), "data", "engine.pid")
+
+
+def _write_pid_lock():
+    """Write our PID to the lock file so other instances can detect us."""
+    try:
+        os.makedirs(os.path.dirname(ENGINE_PID_FILE), exist_ok=True)
+        with open(ENGINE_PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        logger.warning("Could not write engine PID lock: %s", e)
+
+
+def _clear_pid_lock():
+    """Remove the PID file on clean shutdown."""
+    try:
+        if os.path.exists(ENGINE_PID_FILE):
+            os.remove(ENGINE_PID_FILE)
+    except Exception:
+        pass
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is currently running."""
+    try:
+        os.kill(pid, 0)  # signal 0 = just check existence
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except Exception:
+        return False
+
+
+def _wait_for_old_engine_to_die(timeout: int = 45) -> bool:
+    """
+    Wait up to `timeout` seconds for the previous engine instance to exit.
+    Returns True if the old instance is gone (safe to start), False if it
+    timed out (should still start — old container may be on separate host).
+    """
+    if not os.path.exists(ENGINE_PID_FILE):
+        return True
+    try:
+        with open(ENGINE_PID_FILE) as f:
+            old_pid = int(f.read().strip())
+    except Exception:
+        return True  # Unreadable lock → assume safe
+
+    if old_pid == os.getpid():
+        return True  # Our own PID from a previous loop iteration — ignore
+
+    if not _is_pid_alive(old_pid):
+        logger.info("✅ Old engine PID %d is already gone — safe to start", old_pid)
+        return True
+
+    logger.warning(
+        "⏳ Old engine instance (PID %d) still running — waiting up to %ds for it to stop...",
+        old_pid, timeout
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(3)
+        if not _is_pid_alive(old_pid):
+            logger.info("✅ Old engine PID %d stopped after %.0fs — starting new instance",
+                        old_pid, timeout - (deadline - time.time()))
+            return True
+
+    logger.warning(
+        "⚠️ Old engine PID %d still alive after %ds (may be separate container) — "
+        "starting anyway but disabling tradebook writes for first 30s to avoid race",
+        old_pid, timeout
+    )
+    return False  # Timed out — old instance may be on a different container
 
 logger = logging.getLogger("EngineAPI")
 
@@ -426,7 +506,7 @@ def api_close_trade():
             if trade_id and t["trade_id"] == trade_id:
                 target = t
                 break
-            if symbol and t["symbol"] == symbol:
+            if not trade_id and symbol and t["symbol"] == symbol:
                 target = t
                 break
 
@@ -443,30 +523,33 @@ def api_close_trade():
                 pos_id = target.get("position_id")
                 pair = target.get("pair")
 
-                if pos_id:
+                qty = target.get("quantity", 0)
+                side = target.get("side", "BUY")
+                
+                if not pair and symbol:
+                    pair = cdx.to_coindcx_pair(symbol)
+
+                if pair and float(qty) > 0:
+                    qty_to_close = float(qty)
+                    positions = cdx.list_positions()
+                    actual_pos = next((p for p in positions if p.get("pair") == pair and float(p.get("active_pos", 0)) != 0), None)
+                    
+                    if actual_pos:
+                        active_qty = abs(float(actual_pos.get("active_pos", 0)))
+                        if qty_to_close >= active_qty * 0.99:
+                            pos_id_real = actual_pos.get("id") or pos_id
+                            cdx.exit_position(pos_id_real)
+                            exchange_close_result = f"fully closed shared position {pos_id_real}"
+                            logger.info("📤 CLOSE-TRADE: Fully Closed CoinDCX position %s (qty >= total available)", pos_id_real)
+                        else:
+                            cdx.partial_close_position(pair, side.lower(), qty_to_close)
+                            exchange_close_result = f"partially closed {qty_to_close} of {pair}"
+                            logger.info("📤 CLOSE-TRADE: Partially Closed qty=%.6f for %s", qty_to_close, pair)
+                elif pos_id:
+                    # Fallback if entirely missing qty/pair but has pos_id
                     cdx.exit_position(pos_id)
                     exchange_close_result = f"closed position {pos_id}"
                     logger.info("📤 CLOSE-TRADE: Closed CoinDCX position %s", pos_id)
-                elif pair:
-                    # Find position by pair
-                    positions = cdx.list_positions()
-                    for p in positions:
-                        if p.get("pair") == pair and float(p.get("active_pos", 0)) != 0:
-                            cdx.exit_position(p["id"])
-                            exchange_close_result = f"closed position {p['id']}"
-                            logger.info("📤 CLOSE-TRADE: Closed CoinDCX position %s (by pair %s)", p["id"], pair)
-                            break
-                elif symbol:
-                    # Find position by symbol
-                    cdx_pair = cdx.to_coindcx_pair(symbol)
-                    if cdx_pair:
-                        positions = cdx.list_positions()
-                        for p in positions:
-                            if p.get("pair") == cdx_pair and float(p.get("active_pos", 0)) != 0:
-                                cdx.exit_position(p["id"])
-                                exchange_close_result = f"closed position {p['id']}"
-                                logger.info("📤 CLOSE-TRADE: Closed CoinDCX position by symbol %s", symbol)
-                                break
 
                 # Get actual CoinDCX exit price
                 try:
@@ -985,6 +1068,27 @@ def _run_engine():
     BASE_BACKOFF = 10  # seconds
     RECOVERY_COOLDOWN = 300  # 5 minutes before infinite recovery attempt
 
+    # ── PID Lock Guard ────────────────────────────────────────────────
+    # Wait for any existing engine instance (from a Railway overlapping deploy)
+    # to finish before we start our own loop.
+    _wait_for_old_engine_to_die(timeout=45)
+    _write_pid_lock()
+    logger.info("🔒 Engine PID lock acquired (PID %d)", os.getpid())
+
+    try:
+      _run_engine_inner()
+    finally:
+        _clear_pid_lock()
+        logger.info("🔓 Engine PID lock released")
+
+
+def _run_engine_inner():
+    """Inner engine loop — separated so the PID lock wrapper stays clean."""
+    global _engine_bot, _engine_crash_count, _engine_last_crash
+    MAX_RETRIES = 5
+    BASE_BACKOFF = 10  # seconds
+    RECOVERY_COOLDOWN = 300  # 5 minutes before infinite recovery attempt
+
     while True:  # Outer infinite loop for recovery after retry exhaustion
         retry = 0
         while retry < MAX_RETRIES:
@@ -1060,6 +1164,12 @@ def _setup_sigterm_handler():
         # Give the engine thread 15s to wind down
         if _engine_thread and _engine_thread.is_alive():
             _engine_thread.join(timeout=15)
+        # Clear startup lock so next deployment can start cleanly
+        try:
+            if os.path.exists(_STARTUP_LOCK_FILE):
+                os.remove(_STARTUP_LOCK_FILE)
+        except Exception:
+            pass
         logger.info("👋 Engine shut down cleanly after SIGTERM")
         sys.exit(0)
 
@@ -1202,7 +1312,64 @@ def api_force_signal():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/api/athena-log", methods=["GET"])
+def api_athena_log():
+    """Return Athena decision history from athena_decisions.jsonl.
+
+    Query params (all optional):
+      limit    — max rows to return (default 100, max 500)
+      symbol   — filter by coin e.g. BTCUSDT
+      decision — filter by EXECUTE | VETO
+      side     — filter by BUY | SELL
+      from     — ISO date string e.g. 2026-03-20 (inclusive)
+    """
+    try:
+        limit    = min(int(request.args.get("limit", 100)), 500)
+        symbol   = (request.args.get("symbol", "") or "").upper()
+        decision = (request.args.get("decision", "") or "").upper()
+        side     = (request.args.get("side", "") or "").upper()
+        from_str = request.args.get("from", "")
+
+        log_path = os.path.join(config.DATA_DIR, "athena_decisions.jsonl")
+        if not os.path.exists(log_path):
+            return jsonify({"rows": [], "total": 0, "message": "No Athena decisions logged yet"})
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        rows = []
+        for ln in reversed(lines):  # newest first
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+            if symbol   and rec.get("symbol", "") != symbol:
+                continue
+            if decision and rec.get("decision", "").upper() != decision:
+                continue
+            if side     and rec.get("side", "").upper() != side:
+                continue
+            if from_str:
+                try:
+                    if rec.get("ts", "")[:10] < from_str[:10]:
+                        continue
+                except Exception:
+                    pass
+            rows.append(rec)
+            if len(rows) >= limit:
+                break
+
+        return jsonify({"rows": rows, "total": len(lines), "showing": len(rows)})
+    except Exception as e:
+        logger.error("athena-log error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/broadcast-log", methods=["GET"])
+
 def api_broadcast_log():
     """Return last N lines of signal_broadcast.log as structured JSON.
     Supports optional ?bot_ids=id1,id2,... to filter to specific bots only (user-scoping).
@@ -1339,13 +1506,43 @@ _stream_handler.setLevel(logging.INFO)
 logging.getLogger().addHandler(_stream_handler)
 logging.getLogger().setLevel(logging.INFO)
 
-# Start the trading engine and watchdog in background
-# This MUST happen at module scope so it runs even if Railway uses Gunicorn/Flask instead of python
-start_engine()
+# ─── One-shot startup guard ──────────────────────────────────────────
+# engine_api.py runs its module-scope code every time it is imported.
+# On Railway this happens multiple times (overlapping deploys, threads
+# importing each other, etc.). Use an atomic O_CREAT|O_EXCL lock file
+# so only ONE instance ever calls start_engine().
+_STARTUP_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "engine_startup.lock")
 
-_watchdog_thread = threading.Thread(target=_engine_watchdog, daemon=True, name="EngineWatchdog")
-_watchdog_thread.start()
-logger.info("🐕 Engine watchdog started (checks every 60s)")
+def _acquire_startup_lock() -> bool:
+    """Atomically create startup lock file. Returns True only for the winner."""
+    global _ENGINE_INITIALIZED
+    if _ENGINE_INITIALIZED:
+        return False  # Already started in this process
+    try:
+        os.makedirs(os.path.dirname(_STARTUP_LOCK_FILE), exist_ok=True)
+        fd = os.open(_STARTUP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        _ENGINE_INITIALIZED = True
+        logger.info("🔒 Startup lock acquired (PID %d) — this is the primary engine instance", os.getpid())
+        return True
+    except FileExistsError:
+        logger.warning("⏭️  Startup lock already held — skipping duplicate engine start")
+        return False
+    except Exception as e:
+        logger.warning("Could not acquire startup lock (%s) — starting anyway", e)
+        _ENGINE_INITIALIZED = True
+        return True
+
+# Only the instance that wins the startup lock starts the engine
+if _acquire_startup_lock():
+    start_engine()
+    _watchdog_thread = threading.Thread(target=_engine_watchdog, daemon=True, name="EngineWatchdog")
+    _watchdog_thread.start()
+    logger.info("🐕 Engine watchdog started (checks every 60s)")
+else:
+    logger.info("⏭️  Skipped engine + watchdog start — another instance is primary")
+
 
 # ─── Entry Point (Local Testing) ──────────────────────────────────────
 
@@ -1359,3 +1556,48 @@ if __name__ == "__main__":
     logger.info("🌐 Engine API listening on port %d", port)
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
+
+# ─── Trade Journal: Exchange Health ──────────────────────────────────────────
+# Called by Next.js /api/journal/health every 15s.
+# Returns live exchange connectivity, balance, and open position count.
+# Paper engines return mode="paper" with no exchange call.
+
+@app.route("/api/exchange-health", methods=["GET"])
+def api_exchange_health():
+    """Live exchange health for Trade Journal page. Safe to call every 15s."""
+    if config.PAPER_TRADE:
+        return jsonify({
+            "mode": "paper",
+            "status": "n/a",
+            "exchange": None,
+            "balance": 0,
+            "openPositions": 0,
+            "checkedAt": datetime.utcnow().isoformat() + "Z",
+        })
+    try:
+        import coindcx_client as cdx
+        balance = cdx.get_usdt_balance()
+        try:
+            positions = cdx.list_positions()
+            pos_count = len(positions) if isinstance(positions, list) else 0
+        except Exception:
+            pos_count = -1  # -1 = could not fetch position count
+        return jsonify({
+            "mode": "live",
+            "status": "connected",
+            "exchange": config.EXCHANGE_LIVE or "coindcx",
+            "balance": balance,
+            "openPositions": pos_count,
+            "checkedAt": datetime.utcnow().isoformat() + "Z",
+        })
+    except Exception as e:
+        logger.warning("exchange-health: CoinDCX call failed: %s", e)
+        return jsonify({
+            "mode": "live",
+            "status": "failed",
+            "exchange": config.EXCHANGE_LIVE or "coindcx",
+            "balance": 0,
+            "openPositions": 0,
+            "error": str(e),
+            "checkedAt": datetime.utcnow().isoformat() + "Z",
+        })

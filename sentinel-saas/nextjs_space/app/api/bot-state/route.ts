@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import { authOptions } from '@/lib/auth-options';
 import { prisma } from '@/lib/prisma';
-import { syncEngineTrades, getUserTrades } from '@/lib/sync-engine-trades';
+import { syncEngineTrades, getUserTrades, syncAthenaDecisions } from '@/lib/sync-engine-trades';
 import { getEngineUrl } from '@/lib/engine-url';
 
 export const dynamic = 'force-dynamic';
@@ -82,35 +82,47 @@ export async function GET() {
                 orderBy: [{ isActive: 'desc' }, { updatedAt: 'desc' }],
             });
 
-            // Cache trades per engine URL to avoid duplicate fetches across bots
-            const engineTradeCache: Record<string, any[]> = {};
-            if (primaryUrl && engineData) engineTradeCache[primaryUrl] = engineData.tradebook?.trades || [];
-            if (secondaryUrl && paperEngineData) engineTradeCache[secondaryUrl] = paperEngineData.tradebook?.trades || [];
+            // ── MERGED ENGINE SYNC ────────────────────────────────────────────────
+            // PROBLEM: live engine (sentinelbot-engine-live-production) deploys paper trades
+            // into its own tradebook, but the dashboard was only syncing paper bots from
+            // ENGINE_API_URL_PAPER (paper-production) = a DIFFERENT empty tradebook.
+            //
+            // FIX: Collect trades from ALL engines, then sync each user bot against the
+            // full merged pool. allBotIds matching inside syncEngineTrades provides isolation
+            // (each trade is stamped with the bot_id of the deploying bot, so no cross-contamination).
+            const allEngineTrades: any[] = [
+                ...(engineData?.tradebook?.trades || []),
+                // Only add paper engine trades if it's a separate service (avoid duplicates)
+                ...(primaryUrl !== secondaryUrl && paperEngineData?.tradebook?.trades
+                    ? paperEngineData.tradebook.trades
+                    : []),
+            ];
 
             for (const ub of userBots) {
-                if (!ub.startedAt) continue;
-                const isLive = (ub.config?.mode || 'paper').toLowerCase().includes('live');
-                const botEngineUrl = getEngineUrl(isLive ? 'live' : 'paper');
-                if (!botEngineUrl) continue;
-
+                if (allEngineTrades.length === 0) continue;
                 try {
-                    if (!(botEngineUrl in engineTradeCache)) {
-                        const data = await fetchEngineData(botEngineUrl);
-                        engineTradeCache[botEngineUrl] = data?.tradebook?.trades || [];
-                    }
-                    const botTrades = engineTradeCache[botEngineUrl];
-                    if (botTrades.length > 0) {
-                        await syncEngineTrades(botTrades, ub.id, ub.startedAt, userId);
-                    }
+                    // Fall back to epoch so newly-created bots (startedAt=null) sync all trades
+                    const syncFrom = ub.startedAt ?? new Date(0);
+                    const botSegment = (ub.config as any)?.segment || 'ALL';
+                    await syncEngineTrades(allEngineTrades, ub.id, syncFrom, userId, botSegment);
                 } catch (err) {
                     console.error(`[bot-state] Trade sync failed for bot ${ub.id}:`, err);
                 }
             }
 
+
             try {
                 trades = await getUserTrades(userId);
             } catch (err) {
                 console.error('[bot-state] getUserTrades failed:', err);
+            }
+
+            // Sync Athena decisions to DB (fire-and-forget, throttled to 60s)
+            const cycle = multi.cycle || 0;
+            if (cycle > 0 && Object.keys(coinStates).length > 0) {
+                syncAthenaDecisions(coinStates, cycle).catch(err =>
+                    console.error('[bot-state] Athena decision sync failed:', err)
+                );
             }
         }
 
@@ -197,8 +209,36 @@ export async function GET() {
             athena: mergedAthena,
             perBot,
 
+            // Per-bot trade lists — keyed by botId. Clients must use this
+            // instead of the flat `trades` array to avoid cross-segment display.
+            tradesByBot: Object.fromEntries(
+                userBots.map((ub: any) => [
+                    ub.id,
+                    trades.filter((t: any) => (t.bot_id || t.botId) === ub.id),
+                ])
+            ),
+
             tradebook: {
                 trades,
+                // RAW FALLBACK: direct engine trades for instant display (no Prisma round-trip needed)
+                // Dashboard uses these when Prisma is empty (e.g. after engine restart before first sync)
+                // engineData is from primaryUrl (which may be the paper engine if PAPER_URL not set)
+                // paperEngineData may be null if secondary URL not configured
+                rawTrades: (() => {
+                    // Only show engine trades belonging to THIS user's bots.
+                    // rawTrades is a fallback for instant display before Prisma syncs,
+                    // but must never leak other users' trades.
+                    const userBotIds = new Set(userBots.map((b: any) => b.id));
+                    if (userBotIds.size === 0) return []; // user has no bots → no raw trades
+                    const allRaw = [
+                        ...(engineData?.tradebook?.trades || []),
+                        ...((primaryUrl !== secondaryUrl && paperEngineData) ? (paperEngineData?.tradebook?.trades || []) : []),
+                    ];
+                    return allRaw.filter((t: any) =>
+                        (t.status || 'active').toLowerCase() === 'active' &&
+                        userBotIds.has(t.bot_id || t.botId)
+                    );
+                })(),
                 pending_orders: engineTrades.filter((t: any) =>
                     (t.status || '').toUpperCase() === 'OPEN' &&
                     (t.order_type || '').toUpperCase().includes('LIMIT')

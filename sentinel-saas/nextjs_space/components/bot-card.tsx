@@ -1,6 +1,6 @@
 'use client';
 
-import { Bot, Play, Square, ChevronDown, ChevronUp, Trash2, Settings, Zap, Brain } from 'lucide-react';
+import { Play, Square, Trash2, Settings, Archive } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useState } from 'react';
 
@@ -17,26 +17,21 @@ interface BotCardProps {
   };
   onToggle: (botId: string, currentStatus: boolean) => void;
   onDelete?: (botId: string) => void;
+  onRetire?: (botId: string) => void;
   liveTradeCount?: number;
   trades?: any[];
   sessions?: any[];
+  livePrices?: Record<string, number>;
+  isToggling?: boolean;
 }
 
 /* ── helpers ── */
-const pnlColor = (v: number) => v >= 0 ? 'var(--color-success)' : 'var(--color-danger)';
+const pnlColor = (v: number) => v >= 0 ? '#22C55E' : '#EF4444';
 const sign = (v: number) => v >= 0 ? '+' : '';
-const fmt = (n: number) => (n >= 0 ? '+' : '') + n.toFixed(2);
-const fmtDate = (iso: string) => new Date(iso).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' });
-const fmtDuration = (start: string, end: string | null) => {
-  const ms = (end ? new Date(end) : new Date()).getTime() - new Date(start).getTime();
-  const days = Math.floor(ms / 86400000);
-  const hrs = Math.floor((ms % 86400000) / 3600000);
-  return days > 0 ? `${days}d ${hrs}h` : `${hrs}h`;
-};
 
-const BRAIN_META: Record<string, { label: string; color: string; icon: string; glow: string }> = {
-  adaptive: { label: 'Synaptic Adaptive', color: '#22C55E', icon: '🧠', glow: 'rgba(34,197,94,0.18)' },
-  athena: { label: 'Athena AI', color: '#A78BFA', icon: '🏛️', glow: 'rgba(167,139,250,0.18)' },
+const BRAIN_META: Record<string, { label: string; color: string; glow: string }> = {
+  adaptive: { label: 'Synaptic Adaptive', color: '#22C55E', glow: 'rgba(34,197,94,0.18)' },
+  athena: { label: 'Athena AI', color: '#A78BFA', glow: 'rgba(167,139,250,0.18)' },
 };
 const getBrain = (name = '', brainType = '') => {
   if (brainType && BRAIN_META[brainType]) return BRAIN_META[brainType];
@@ -44,37 +39,42 @@ const getBrain = (name = '', brainType = '') => {
   return BRAIN_META.adaptive;
 };
 
-// Segment icon derived from bot name (matches bots-client.tsx BOT_MODELS)
+// Segment icon - extract segment name from bot name
 const SEGMENT_ICONS: Record<string, { icon: string; color: string }> = {
-  'L1':     { icon: '🔷', color: '#A78BFA' },
-  'L2':     { icon: '🔗', color: '#22D3EE' },
-  'DeFi':   { icon: '🌊', color: '#34D399' },
-  'Gaming': { icon: '🎮', color: '#FBBF24' },
-  'AI':     { icon: '🤖', color: '#F472B6' },
-  'RWA':    { icon: '🏦', color: '#60A5FA' },
-  'ALL':    { icon: '⚡', color: '#22C55E' },
+  'L1':      { icon: '🔷', color: '#A78BFA' },
+  'L2':      { icon: '🔗', color: '#22D3EE' },
+  'DeFi':    { icon: '🌊', color: '#34D399' },
+  'Gaming':  { icon: '🎮', color: '#FBBF24' },
+  'AI':      { icon: '🤖', color: '#F472B6' },
+  'RWA':     { icon: '🏦', color: '#60A5FA' },
+  'Meme':    { icon: '🐸', color: '#FCD34D' },
+  'DePIN':   { icon: '📡', color: '#F97316' },
+  'Modular': { icon: '🧩', color: '#8B5CF6' },
+  'ALL':     { icon: '⚡', color: '#22C55E' },
 };
-function getSegmentBadge(botName: string): { icon: string; color: string } | null {
+function getSegmentInfo(botName: string): { name: string; icon: string; color: string } {
   const n = (botName || '').toLowerCase();
-  if (n.includes('all') || n.includes('adaptive') || n.includes('synaptic')) return SEGMENT_ICONS['ALL'];
-  if (n.includes('l1') || n.includes('layer 1') || n.includes('layer1')) return SEGMENT_ICONS['L1'];
-  if (n.includes('l2') || n.includes('layer 2') || n.includes('layer2')) return SEGMENT_ICONS['L2'];
-  if (n.includes('defi') || n.includes('de-fi')) return SEGMENT_ICONS['DeFi'];
-  if (n.includes('gaming') || n.includes('game') || n.includes('metaverse')) return SEGMENT_ICONS['Gaming'];
-  if (n.includes('ai') || n.includes('intelligence') || n.includes('neural')) return SEGMENT_ICONS['AI'];
-  if (n.includes('rwa') || n.includes('real world') || n.includes('asset')) return SEGMENT_ICONS['RWA'];
-  return null;
+  if (n.includes('l1') || n.includes('layer 1') || n.includes('layer1')) return { name: 'L1', ...SEGMENT_ICONS['L1'] };
+  if (n.includes('l2') || n.includes('layer 2') || n.includes('layer2')) return { name: 'L2', ...SEGMENT_ICONS['L2'] };
+  if (n.includes('defi') || n.includes('de-fi')) return { name: 'DeFi', ...SEGMENT_ICONS['DeFi'] };
+  if (n.includes('gaming') || n.includes('game') || n.includes('metaverse')) return { name: 'Gaming', ...SEGMENT_ICONS['Gaming'] };
+  if (n.includes('ai') || n.includes('intelligence') || n.includes('neural')) return { name: 'AI', ...SEGMENT_ICONS['AI'] };
+  if (n.includes('rwa') || n.includes('real world') || n.includes('asset')) return { name: 'RWA', ...SEGMENT_ICONS['RWA'] };
+  if (n.includes('meme')) return { name: 'Meme', ...SEGMENT_ICONS['Meme'] };
+  if (n.includes('depin')) return { name: 'DePIN', ...SEGMENT_ICONS['DePIN'] };
+  if (n.includes('modular')) return { name: 'Modular', ...SEGMENT_ICONS['Modular'] };
+  return { name: 'ALL', ...SEGMENT_ICONS['ALL'] };
 }
 
-export function BotCard({ bot, onToggle, onDelete, liveTradeCount, trades = [], sessions = [] }: BotCardProps) {
-  const [expanded, setExpanded] = useState(false);
-  const [tab, setTab] = useState<'trades' | 'sessions'>('trades');
+export function BotCard({ bot, onToggle, onDelete, onRetire, trades = [], livePrices = {}, isToggling = false }: BotCardProps) {
   const [showSettings, setShowSettings] = useState(false);
   const [settingsMode, setSettingsMode] = useState(bot?.config?.mode || 'paper');
   const [settingsCPT, setSettingsCPT] = useState(bot?.config?.capitalPerTrade || 100);
   const [settingsMaxTrades, setSettingsMaxTrades] = useState(bot?.config?.maxTrades || 25);
   const [saving, setSaving] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [retireConfirm, setRetireConfirm] = useState(false);
+  const [retiring, setRetiring] = useState(false);
 
   const isRunning = bot?.isActive ?? false;
   const brainType = (bot?.config as any)?.brainType || 'adaptive';
@@ -83,29 +83,40 @@ export function BotCard({ bot, onToggle, onDelete, liveTradeCount, trades = [], 
   const capitalPerTrade = bot?.config?.capitalPerTrade || 100;
   const maxTrades = bot?.config?.maxTrades || 25;
   const maxCapital = maxTrades * capitalPerTrade;
+  const segment = getSegmentInfo(bot?.name || '');
 
   const activeTrades = trades.filter((t: any) => (t.status || '').toLowerCase() === 'active');
   const closedTrades = trades.filter((t: any) => (t.status || '').toLowerCase() !== 'active');
-  const totalTrades = trades.length;
 
   const winCount = closedTrades.filter((t: any) => (parseFloat(t.realized_pnl) || parseFloat(t.totalPnl) || 0) > 0).length;
   const winRate = closedTrades.length > 0 ? (winCount / closedTrades.length * 100) : null;
 
-  const activePnl = isRunning
-    ? activeTrades.reduce((s: number, t: any) => s + (parseFloat(t.unrealized_pnl) || parseFloat(t.activePnl) || 0), 0)
-    : 0;
-  const totalPnl = trades.reduce((s: number, t: any) => {
-    const isActive = (t.status || '').toLowerCase() === 'active';
-    return s + (isActive
-      ? (parseFloat(t.unrealized_pnl) || parseFloat(t.activePnl) || 0)
-      : (parseFloat(t.realized_pnl) || parseFloat(t.totalPnl) || parseFloat(t.pnl) || 0));
-  }, 0);
+  const totalPnl = (() => {
+    // Realized from closed trades
+    const realized = closedTrades.reduce((s: number, t: any) =>
+      s + (parseFloat(t.realized_pnl) || parseFloat(t.totalPnl) || parseFloat(t.pnl) || 0), 0);
+    // Unrealized from active trades using live prices (matches dashboard calcUnrealized)
+    const unrealized = activeTrades.reduce((s: number, t: any) => {
+      const sym = (t.symbol || (t.coin || '') + 'USDT').toUpperCase();
+      const cp = livePrices[sym] || t.current_price || t.currentPrice || t.entry_price || t.entryPrice;
+      const entry = t.entry_price || t.entryPrice || 0;
+      const cap = t.capital || t.position_size || 100;
+      const lev = t.leverage || 1;
+      if (!cp || !entry || entry === 0 || cap === 0) return s;
+      const pos = (t.side || t.position || '').toLowerCase();
+      const isLong = pos === 'long' || pos === 'buy';
+      const diff = isLong ? (cp - entry) : (entry - cp);
+      return s + Math.round(diff / entry * lev * cap * 10000) / 10000;
+    }, 0);
+    return realized + unrealized;
+  })();
 
   const capitalDeployed = activeTrades.length * capitalPerTrade;
   const deployedPct = maxCapital > 0 ? Math.min(100, (capitalDeployed / maxCapital) * 100) : 0;
   const roiPct = maxCapital > 0 ? (totalPnl / maxCapital * 100) : 0;
 
   const handleSaveSettings = async () => {
+    if (settingsCPT <= 0 || settingsMaxTrades <= 0) { alert('Capital and max trades must be greater than 0.'); return; }
     setSaving(true);
     try {
       const res = await fetch('/api/bots/config', {
@@ -113,8 +124,9 @@ export function BotCard({ bot, onToggle, onDelete, liveTradeCount, trades = [], 
         body: JSON.stringify({ botId: bot?.id, mode: settingsMode, capitalPerTrade: settingsCPT, maxOpenTrades: settingsMaxTrades }),
       });
       if (res.ok) { setShowSettings(false); window.location.reload(); }
-    } catch (e) { console.error('Settings save error:', e); }
-    setSaving(false);
+      else { const d = await res.json().catch(() => ({})); alert(d.error || 'Failed to save settings'); }
+    } catch { alert('Failed to save settings. Please try again.'); }
+    finally { setSaving(false); }
   };
 
   const handleDeleteClick = () => {
@@ -122,230 +134,230 @@ export function BotCard({ bot, onToggle, onDelete, liveTradeCount, trades = [], 
     onDelete?.(bot?.id ?? '');
   };
 
+  const handleRetireClick = () => {
+    if (isRunning) return; // must stop first
+    if (!retireConfirm) {
+      setRetireConfirm(true);
+      setTimeout(() => setRetireConfirm(false), 4000);
+      return;
+    }
+    setRetiring(true);
+    onRetire?.(bot?.id ?? '');
+  };
+
+  const MetricCell = ({ label, value, color }: { label: string; value: string; color?: string }) => (
+    <div style={{ textAlign: 'center' }}>
+      <div style={{
+        fontSize: '14px', fontWeight: 800, fontFamily: 'var(--font-mono, monospace)',
+        color: color || 'var(--color-text)', lineHeight: 1.2,
+      }}>
+        {value}
+      </div>
+      <div style={{ fontSize: '8px', fontWeight: 700, color: 'var(--color-text-secondary)', letterSpacing: '0.8px', textTransform: 'uppercase' as const, marginTop: 2 }}>
+        {label}
+      </div>
+    </div>
+  );
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       style={{
-        background: 'rgba(8, 14, 26, 0.8)',
+        background: 'var(--color-surface)',
         backdropFilter: 'blur(14px)',
         WebkitBackdropFilter: 'blur(14px)',
-        border: `1px solid ${isRunning ? brain.color + '35' : 'rgba(0,229,255,0.08)'}`,
-        borderRadius: 'var(--radius-lg)',
+        border: `1px solid ${isRunning ? brain.color + '25' : 'var(--color-border)'}`,
+        borderRadius: 16,
         boxShadow: isRunning
-          ? `0 0 32px ${brain.glow}, 0 0 0 1px ${brain.color}15, var(--shadow-card)`
+          ? `0 0 24px ${brain.glow}, var(--shadow-card)`
           : 'var(--shadow-card)',
-        animation: isRunning ? 'breatheBorder 2.5s ease-in-out infinite' : 'none',
         overflow: 'hidden',
-
+        position: 'relative' as const,
+        display: 'flex',
+        flexDirection: 'column' as const,
       }}
       whileHover={{
-        boxShadow: `0 0 48px ${brain.glow}, 0 8px 40px rgba(0,0,0,0.7)`,
+        boxShadow: `0 0 36px ${brain.glow}, 0 6px 30px rgba(0,0,0,0.6)`,
         translateY: -2,
       }}
     >
-      {/* ── Vertical accent bar ── */}
+      {/* Top accent bar */}
       <div style={{
-        position: 'absolute', left: 0, top: 0, bottom: 0, width: 3,
+        position: 'absolute', top: 0, left: 0, right: 0, height: '2px',
         background: isRunning
-          ? `linear-gradient(to bottom, ${brain.color}, ${brain.color}88)`
-          : 'rgba(107,114,128,0.3)',
-        borderRadius: '3px 0 0 3px',
-        transition: 'background 0.3s',
+          ? `linear-gradient(90deg, transparent, ${brain.color}88, transparent)`
+          : 'linear-gradient(90deg, transparent, var(--color-border), transparent)',
       }} />
 
-      {/* ════ MAIN ROW ════ */}
-      <div
-        onClick={() => setExpanded(!expanded)}
-        style={{ display: 'flex', alignItems: 'center', gap: 20, padding: '16px 20px 16px 24px', cursor: 'pointer' }}
-      >
-        {/* Left: Bot identity */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14, minWidth: 0, flex: '0 0 260px' }}>
-          {/* Avatar with segment icon badge */}
-          <div style={{ position: 'relative', width: 54, height: 54, flexShrink: 0 }}>
-
-            {/* Avatar circle */}
-            <div style={{
-              position: 'relative', width: 54, height: 54, borderRadius: '50%',
-              background: `linear-gradient(135deg, ${brain.color}25, rgba(0,0,0,0.6))`,
-              border: `2px solid ${brain.color}40`,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 22, zIndex: 1, overflow: 'hidden',
-            }}>
-              <img
-                src="/brain-circle.png"
-                alt="brain"
-                style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '50%' }}
-              />
-            </div>
-
-            {/* Segment badge — bottom-right corner of avatar */}
-            {(() => {
-              const seg = getSegmentBadge(bot?.name || '');
-              if (!seg) return null;
-              return (
-                <div style={{
-                  position: 'absolute', bottom: -2, right: -2, zIndex: 2,
-                  width: 20, height: 20, borderRadius: '50%',
-                  background: `radial-gradient(circle, ${seg.color}33, rgba(8,14,26,0.95))`,
-                  border: `1.5px solid ${seg.color}60`,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: 10, lineHeight: 1,
-                  boxShadow: `0 0 6px ${seg.color}55`,
-                }}>
-                  {seg.icon}
-                </div>
-              );
-            })()}
-          </div>{/* /avatar wrapper */}
+      {/* ── Header: Segment + Name + Status ── */}
+      <div style={{ padding: '14px 14px 0', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          {/* Segment icon */}
+          <div style={{
+            width: 34, height: 34, borderRadius: 10, flexShrink: 0,
+            background: `${segment.color}15`,
+            border: `1px solid ${segment.color}30`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 16,
+          }}>
+            {segment.icon}
+          </div>
           <div style={{ minWidth: 0 }}>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 700, color: 'var(--color-text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              {bot?.name ?? 'Bot'}
+            <div style={{
+              fontSize: '13px', fontWeight: 700, color: 'var(--color-text)',
+              whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+            }}>
+              {segment.name}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 3 }}>
-              {/* Running status */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 }}>
               {isRunning && <span className="live-dot" />}
-              <span style={{ fontSize: 'var(--text-xs)', color: isRunning ? brain.color : 'var(--color-text-muted)', fontWeight: 600 }}>
+              <span style={{ fontSize: '10px', fontWeight: 600, color: isRunning ? brain.color : 'var(--color-text-secondary)' }}>
                 {isRunning ? 'Running' : 'Stopped'}
               </span>
               <span style={{
-                fontSize: 'var(--text-xs)', fontWeight: 600, padding: '1px 7px', borderRadius: 20,
-                background: botMode === 'live' ? 'var(--color-danger-bg)' : 'var(--color-info-bg)',
-                color: botMode === 'live' ? 'var(--color-danger)' : 'var(--color-info)',
+                fontSize: '9px', fontWeight: 700, padding: '1px 5px', borderRadius: 4,
+                background: botMode === 'live' ? 'rgba(239,68,68,0.12)' : 'rgba(6,182,212,0.1)',
+                color: botMode === 'live' ? '#EF4444' : '#06B6D4',
               }}>
                 {botMode === 'live' ? 'Live' : 'Paper'}
               </span>
-              <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-                {bot?.exchange}
-              </span>
             </div>
           </div>
         </div>
-
-        {/* Middle: 4-metric chip grid */}
-        <div style={{ display: 'flex', gap: 24, flex: 1, alignItems: 'center' }}>
-          {/* Active Trades */}
-          <div style={{ textAlign: 'center', minWidth: 52 }}>
-            <div style={{ fontSize: 20, fontWeight: 800, fontFamily: 'var(--font-mono)', color: activeTrades.length > 0 ? '#00E5FF' : 'var(--color-text)', textShadow: activeTrades.length > 0 ? '0 0 10px rgba(0,229,255,0.4)' : undefined }}>
-              {activeTrades.length}
-            </div>
-            <div className="stat-label">Active</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: 'rgba(0,229,255,0.08)' }} />
-          {/* Total PnL */}
-          <div style={{ textAlign: 'center', minWidth: 80 }}>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 800, fontFamily: 'var(--font-mono)', color: pnlColor(totalPnl), textShadow: totalPnl >= 0 ? '0 0 10px rgba(0,255,136,0.4)' : '0 0 10px rgba(255,59,92,0.4)' }}>
-              {sign(totalPnl)}${Math.abs(totalPnl).toFixed(2)}
-            </div>
-            <div className="stat-label">Total PnL</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: 'rgba(0,229,255,0.08)' }} />
-          {/* Win Rate */}
-          <div style={{ textAlign: 'center', minWidth: 56 }}>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 700, fontFamily: 'var(--font-mono)', color: winRate !== null && winRate >= 50 ? '#00FF88' : 'var(--color-text-secondary)', textShadow: winRate !== null && winRate >= 50 ? '0 0 8px rgba(0,255,136,0.35)' : undefined }}>
-              {winRate !== null ? `${winRate.toFixed(0)}%` : '—'}
-            </div>
-            <div className="stat-label">Win Rate</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: 'rgba(0,229,255,0.08)' }} />
-          {/* ROI */}
-          <div style={{ textAlign: 'center', minWidth: 64 }}>
-            <div style={{ fontSize: 'var(--text-md)', fontWeight: 700, fontFamily: 'var(--font-mono)', color: roiPct >= 0 ? '#00FF88' : '#FF3B5C', textShadow: roiPct >= 0 ? '0 0 8px rgba(0,255,136,0.35)' : '0 0 8px rgba(255,59,92,0.35)' }}>
-              {sign(roiPct)}{roiPct.toFixed(1)}%
-            </div>
-            <div className="stat-label">ROI</div>
-          </div>
-        </div>
-
-        {/* Capital progress bar */}
-        <div style={{ flex: '0 0 140px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
-            <span className="stat-label">Capital</span>
-            <span style={{ fontSize: 'var(--text-xs)', fontWeight: 700, fontFamily: 'monospace', color: 'var(--color-info)' }}>
-              ${capitalDeployed}<span style={{ color: 'var(--color-text-muted)', fontWeight: 400 }}>/${maxCapital}</span>
-            </span>
-          </div>
+        {/* PnL Top Right */}
+        <div style={{ textAlign: 'right' }}>
           <div style={{
-            height: 5, borderRadius: 10, background: 'rgba(255,255,255,0.07)', overflow: 'hidden',
+            fontSize: '18px', fontWeight: 800, fontFamily: 'var(--font-mono, monospace)',
+            color: pnlColor(totalPnl),
+            textShadow: `0 0 8px ${pnlColor(totalPnl)}33`,
+            lineHeight: 1,
           }}>
-            <div style={{
-              height: '100%', borderRadius: 10, width: `${deployedPct}%`,
-              background: deployedPct > 75
-                ? 'linear-gradient(90deg, #F59E0B, #D97706)'
-                : 'linear-gradient(90deg, var(--color-primary), var(--color-accent))',
-              transition: 'width 0.5s ease',
-            }} />
+            {sign(totalPnl)}${Math.abs(totalPnl).toFixed(2)}
           </div>
-          <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', marginTop: 4, textAlign: 'right' }}>
-            {deployedPct.toFixed(0)}% deployed
+          <div style={{ fontSize: '9px', fontWeight: 700, color: 'var(--color-text-secondary)', letterSpacing: '1px', textTransform: 'uppercase' as const, marginTop: 3 }}>
+            Total P&L
           </div>
         </div>
+      </div>
 
-        {/* Right: Action buttons */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-          {/* Start / Stop */}
+      {/* ── 3-col metrics: Win Rate | Active | ROI ── */}
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 0,
+        padding: '14px 14px 10px',
+      }}>
+        <MetricCell
+          label="Win Rate"
+          value={winRate !== null ? `${winRate.toFixed(0)}%` : '—'}
+          color={winRate !== null && winRate >= 50 ? '#22C55E' : '#9CA3AF'}
+        />
+        <MetricCell
+          label="Active"
+          value={`${activeTrades.length}`}
+          color={activeTrades.length > 0 ? '#00E5FF' : '#9CA3AF'}
+        />
+        <MetricCell
+          label="ROI"
+          value={`${sign(roiPct)}${roiPct.toFixed(1)}%`}
+          color={pnlColor(roiPct)}
+        />
+      </div>
+
+      {/* ── Capital bar ── */}
+      <div style={{ padding: '0 14px 12px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+          <span style={{ fontSize: '8px', fontWeight: 700, color: 'var(--color-text-secondary)', letterSpacing: '0.8px', textTransform: 'uppercase' as const }}>Capital</span>
+          <span style={{ fontSize: '10px', fontWeight: 700, fontFamily: 'monospace', color: 'var(--color-text-secondary)' }}>
+            ${capitalDeployed}<span style={{ color: 'var(--color-text-secondary)', opacity: 0.6 }}>/${maxCapital}</span>
+          </span>
+        </div>
+        <div style={{ height: 4, borderRadius: 4, background: 'var(--color-border)', overflow: 'hidden' }}>
+          <div style={{
+            height: '100%', borderRadius: 4, width: `${deployedPct}%`,
+            background: deployedPct > 75
+              ? 'linear-gradient(90deg, #F59E0B, #D97706)'
+              : 'linear-gradient(90deg, #06B6D4, #22D3EE)',
+            transition: 'width 0.5s ease',
+          }} />
+        </div>
+      </div>
+
+      {/* ── Action buttons ── */}
+      <div style={{
+        display: 'flex', gap: 6, padding: '0 14px 12px',
+        borderTop: '1px solid var(--color-border)', paddingTop: 10,
+      }}>
+        <button
+          onClick={(e) => { e.stopPropagation(); if (!isToggling) onToggle(bot?.id ?? '', isRunning); }}
+          disabled={isToggling}
+          style={{
+            flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 5,
+            padding: '7px 0', borderRadius: 8,
+            background: isRunning ? 'rgba(239,68,68,0.1)' : `${brain.color}15`,
+            color: isRunning ? '#EF4444' : brain.color,
+            border: `1px solid ${isRunning ? 'rgba(239,68,68,0.25)' : brain.color + '25'}`,
+            fontSize: '11px', fontWeight: 700,
+            cursor: isToggling ? 'wait' : 'pointer',
+            opacity: isToggling ? 0.6 : 1,
+            transition: 'all 0.2s',
+          }}
+        >
+          {isToggling
+            ? '…'
+            : isRunning
+              ? <><Square style={{ width: 11, height: 11 }} /> Stop</>
+              : <><Play style={{ width: 11, height: 11 }} /> Start</>
+          }
+        </button>
+
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowSettings(!showSettings); setDeleteConfirm(false); }}
+          title="Settings"
+          style={{
+            width: 32, height: 32, borderRadius: 8, cursor: 'pointer',
+            background: showSettings ? 'var(--color-primary-transparent)' : 'var(--color-surface-light)',
+            color: showSettings ? 'var(--color-primary)' : 'var(--color-text-secondary)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s',
+            border: '1px solid var(--color-border)',
+          }}
+        ><Settings style={{ width: 13, height: 13 }} /></button>
+
+        {/* Retire button — only visible when bot is stopped */}
+        {!isRunning && onRetire && (
           <button
-            onClick={(e) => { e.stopPropagation(); onToggle(bot?.id ?? '', isRunning); }}
+            onClick={(e) => { e.stopPropagation(); handleRetireClick(); }}
+            title={isRunning ? 'Stop the bot first before retiring' : retireConfirm ? 'Click again to confirm retirement' : 'Retire bot (archive with history)'}
+            disabled={isRunning || retiring}
             style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: '8px 16px', borderRadius: 'var(--radius-md)',
-              background: isRunning
-                ? 'linear-gradient(135deg, rgba(239,68,68,0.15), rgba(239,68,68,0.08))'
-                : `linear-gradient(135deg, ${brain.color}22, ${brain.color}10)`,
-              color: isRunning ? 'var(--color-danger)' : brain.color,
-              border: `1px solid ${isRunning ? 'rgba(239,68,68,0.3)' : brain.color + '30'}`,
-              fontSize: 'var(--text-xs)', fontWeight: 700, cursor: 'pointer',
-              transition: 'all 0.2s', whiteSpace: 'nowrap',
+              width: 32, height: 32, borderRadius: 8, cursor: isRunning ? 'not-allowed' : retiring ? 'wait' : 'pointer',
+              background: retireConfirm ? 'rgba(251,191,36,0.2)' : 'rgba(251,191,36,0.06)',
+              color: retireConfirm ? '#FCD34D' : 'rgba(251,191,36,0.5)',
+              border: `1px solid ${retireConfirm ? 'rgba(252,211,77,0.4)' : 'rgba(251,191,36,0.15)'}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s',
+              opacity: isRunning || retiring ? 0.4 : 1,
             }}
+            onBlur={() => setTimeout(() => setRetireConfirm(false), 200)}
           >
-            {isRunning
-              ? <><Square style={{ width: 13, height: 13 }} /> Stop</>
-              : <><Play style={{ width: 13, height: 13 }} /> Start</>
-            }
+            {retiring ? <span style={{ fontSize: 10 }}>…</span> : <Archive style={{ width: 12, height: 12 }} />}
           </button>
+        )}
 
-          {/* Settings gear */}
+        {onDelete && (
           <button
-            onClick={(e) => { e.stopPropagation(); setShowSettings(!showSettings); setDeleteConfirm(false); }}
-            title="Settings"
+            onClick={(e) => { e.stopPropagation(); handleDeleteClick(); }}
+            title={deleteConfirm ? 'Click again to confirm' : 'Delete bot'}
             style={{
-              width: 34, height: 34, borderRadius: 'var(--radius-md)', border: 'none', cursor: 'pointer',
-              background: showSettings ? 'rgba(6,182,212,0.2)' : 'rgba(255,255,255,0.05)',
-              color: showSettings ? 'var(--color-info)' : 'var(--color-text-secondary)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              transition: 'all 0.2s',
+              width: 32, height: 32, borderRadius: 8, cursor: 'pointer',
+              background: deleteConfirm ? 'rgba(239,68,68,0.2)' : 'rgba(239,68,68,0.06)',
+              color: deleteConfirm ? '#F87171' : 'rgba(239,68,68,0.5)',
+              border: `1px solid ${deleteConfirm ? 'rgba(239,68,68,0.3)' : 'rgba(239,68,68,0.1)'}`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', transition: 'all 0.2s',
             }}
-          ><Settings style={{ width: 15, height: 15 }} /></button>
-
-          {/* Delete */}
-          {onDelete && (
-            <button
-              onClick={(e) => { e.stopPropagation(); handleDeleteClick(); }}
-              title={deleteConfirm ? 'Click again to confirm' : 'Delete bot'}
-              style={{
-                height: 34, padding: '0 12px', borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                background: deleteConfirm ? 'rgba(239,68,68,0.25)' : 'rgba(239,68,68,0.08)',
-                color: deleteConfirm ? '#F87171' : 'rgba(239,68,68,0.6)',
-                border: `1px solid ${deleteConfirm ? 'rgba(239,68,68,0.4)' : 'rgba(239,68,68,0.15)'}`,
-                display: 'flex', alignItems: 'center', gap: 5,
-                fontSize: deleteConfirm ? 'var(--text-xs)' : undefined,
-                fontWeight: 700, transition: 'all 0.2s', whiteSpace: 'nowrap',
-              }}
-              onBlur={() => setTimeout(() => setDeleteConfirm(false), 200)}
-            >
-              <Trash2 style={{ width: 13, height: 13 }} />
-              {deleteConfirm && 'Confirm'}
-            </button>
-          )}
-
-          {/* Expand chevron */}
-          <div style={{ color: 'var(--color-text-muted)', paddingLeft: 4 }}>
-            {expanded
-              ? <ChevronUp style={{ width: 16, height: 16 }} />
-              : <ChevronDown style={{ width: 16, height: 16 }} />
-            }
-          </div>
-        </div>
+            onBlur={() => setTimeout(() => setDeleteConfirm(false), 200)}
+          >
+            <Trash2 style={{ width: 12, height: 12 }} />
+          </button>
+        )}
       </div>
 
       {/* ════ SETTINGS PANEL ════ */}
@@ -360,217 +372,56 @@ export function BotCard({ bot, onToggle, onDelete, liveTradeCount, trades = [], 
           >
             <div style={{
               borderTop: '1px solid var(--color-border)',
-              padding: '16px 24px',
-              background: 'rgba(6,182,212,0.03)',
+              padding: '12px 14px',
+              background: 'var(--color-surface-light)',
             }}>
-              <div className="section-title" style={{ marginBottom: 12, color: 'var(--color-info)' }}>
-                ⚙️ Bot Configuration
+              <div style={{ fontSize: '10px', fontWeight: 700, color: 'var(--color-primary)', marginBottom: 10, letterSpacing: '0.8px', textTransform: 'uppercase' as const }}>
+                ⚙️ Configuration
               </div>
-              <div style={{ display: 'flex', gap: 16, alignItems: 'flex-end', flexWrap: 'wrap' }}>
-                <div style={{ flex: 1, minWidth: 120 }}>
-                  <label style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginBottom: 5, fontWeight: 600 }}>
-                    Trading Mode
-                  </label>
-                  <select value={settingsMode} onChange={(e) => setSettingsMode(e.target.value)} className="input-field" style={{ fontSize: 'var(--text-sm)' }}>
+              <div style={{ display: 'flex', flexDirection: 'column' as const, gap: 8 }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: '9px', color: 'var(--color-text-secondary)', marginBottom: 3, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>Mode</label>
+                  <select value={settingsMode} onChange={(e) => setSettingsMode(e.target.value)} className="input-field" style={{ fontSize: '12px', width: '100%' }}>
                     <option value="paper">🟢 Paper</option>
                     <option value="live">🔴 Live</option>
                   </select>
                 </div>
-                <div style={{ flex: 1, minWidth: 120 }}>
-                  <label style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginBottom: 5, fontWeight: 600 }}>
-                    Capital Per Trade ($)
-                  </label>
-                  <input type="number" value={settingsCPT}
-                    onChange={(e) => setSettingsCPT(Number(e.target.value))}
-                    className="input-field" style={{ fontSize: 'var(--text-sm)', fontFamily: 'monospace' }}
-                  />
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '9px', color: 'var(--color-text-secondary)', marginBottom: 3, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>Capital/Trade ($)</label>
+                    <input type="number" value={settingsCPT} min={1} max={100000}
+                      onChange={(e) => setSettingsCPT(Math.max(1, Number(e.target.value)))}
+                      className="input-field" style={{ fontSize: '12px', fontFamily: 'monospace', width: '100%', background: 'var(--color-background)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                    />
+                  </div>
+                  <div>
+                    <label style={{ display: 'block', fontSize: '9px', color: 'var(--color-text-secondary)', marginBottom: 3, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>Max Trades</label>
+                    <input type="number" value={settingsMaxTrades} min={1} max={100}
+                      onChange={(e) => setSettingsMaxTrades(Math.max(1, Number(e.target.value)))}
+                      className="input-field" style={{ fontSize: '12px', fontFamily: 'monospace', width: '100%', background: 'var(--color-background)', color: 'var(--color-text)', border: '1px solid var(--color-border)' }}
+                    />
+                  </div>
                 </div>
-                <div style={{ flex: 1, minWidth: 120 }}>
-                  <label style={{ display: 'block', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', marginBottom: 5, fontWeight: 600 }}>
-                    Max Open Trades
-                  </label>
-                  <input type="number" value={settingsMaxTrades}
-                    onChange={(e) => setSettingsMaxTrades(Number(e.target.value))}
-                    className="input-field" style={{ fontSize: 'var(--text-sm)', fontFamily: 'monospace' }}
-                  />
-                </div>
-                <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ display: 'flex', gap: 6, marginTop: 2 }}>
                   <button onClick={handleSaveSettings} disabled={saving}
                     style={{
-                      padding: '9px 20px', borderRadius: 'var(--radius-md)', border: '1px solid rgba(6,182,212,0.35)',
-                      background: 'rgba(6,182,212,0.12)', color: 'var(--color-info)',
-                      fontSize: 'var(--text-sm)', fontWeight: 700, cursor: saving ? 'wait' : 'pointer',
+                      flex: 1, padding: '7px 0', borderRadius: 8, border: '1px solid var(--color-primary)',
+                      background: 'var(--color-primary-transparent)', color: 'var(--color-primary)',
+                      fontSize: '11px', fontWeight: 700, cursor: saving ? 'wait' : 'pointer',
                       opacity: saving ? 0.7 : 1,
                     }}>
                     {saving ? 'Saving…' : 'Save'}
                   </button>
-                  <button onClick={() => setShowSettings(false)} className="btn-ghost" style={{ padding: '9px 16px' }}>
+                  <button onClick={() => setShowSettings(false)}
+                    style={{
+                      flex: 1, padding: '7px 0', borderRadius: 8, border: '1px solid var(--color-border)',
+                      background: 'transparent', color: 'var(--color-text-secondary)',
+                      fontSize: '11px', fontWeight: 700, cursor: 'pointer',
+                    }}>
                     Cancel
                   </button>
                 </div>
               </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* ════ EXPANDABLE DETAILS ════ */}
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.22 }}
-            style={{ overflow: 'hidden' }}
-          >
-            <div style={{ borderTop: '1px solid var(--color-border)' }}>
-              {/* Tab bar */}
-              <div style={{ display: 'flex', borderBottom: '1px solid var(--color-border-subtle)' }}>
-                {(['trades', 'sessions'] as const).map(t => (
-                  <button key={t} onClick={() => setTab(t)} style={{
-                    flex: 1, padding: '10px 0', fontSize: 'var(--text-xs)', fontWeight: 700,
-                    color: tab === t ? 'var(--color-info)' : 'var(--color-text-muted)',
-                    borderBottom: `2px solid ${tab === t ? 'var(--color-info)' : 'transparent'}`,
-                    background: 'transparent', border: 'none', borderBottomStyle: 'solid',
-                    cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.8px',
-                    transition: 'all 0.2s',
-                  }}>
-                    {t === 'trades' ? `Trades (${trades.length})` : `Sessions (${sessions.length})`}
-                  </button>
-                ))}
-              </div>
-
-              {/* Trades tab */}
-              {tab === 'trades' && trades.length > 0 && (
-                <div style={{ padding: '4px 20px 16px' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 'var(--text-sm)' }}>
-                    <thead>
-                      <tr>
-                        {['Coin', 'Side', 'Entry', 'Current', 'PnL', 'Lev', 'Status'].map(h => (
-                          <th key={h} style={{
-                            padding: '10px 6px', textAlign: h === 'Coin' || h === 'Side' ? 'left' : 'right',
-                            fontWeight: 600, color: 'var(--color-text-muted)',
-                            fontSize: 'var(--text-xs)', textTransform: 'uppercase', letterSpacing: '0.6px',
-                            borderBottom: '1px solid var(--color-border-subtle)',
-                            ...(h === 'Status' ? { textAlign: 'center' } : {}),
-                          }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {trades.slice(0, 20).map((t: any, idx: number) => {
-                        const isActiveTrade = (t.status || '').toLowerCase() === 'active';
-                        const pnl = isActiveTrade
-                          ? (parseFloat(t.unrealized_pnl) || parseFloat(t.pnl) || 0)
-                          : (parseFloat(t.total_pnl) || parseFloat(t.realized_pnl) || parseFloat(t.pnl) || 0);
-                        const side = t.side || '-';
-                        const isLong = side === 'LONG' || side === 'BUY';
-                        return (
-                          <tr key={idx} style={{ borderBottom: '1px solid var(--color-border-subtle)' }}>
-                            <td style={{ padding: '8px 6px', fontWeight: 700, color: 'var(--color-text)' }}>
-                              {(t.symbol || t.coin || '').replace('USDT', '')}
-                            </td>
-                            <td style={{ padding: '8px 6px' }}>
-                              <span style={{
-                                fontSize: 'var(--text-xs)', fontWeight: 700, padding: '2px 7px', borderRadius: 4,
-                                background: isLong ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)',
-                                color: isLong ? 'var(--color-success)' : 'var(--color-danger)',
-                              }}>{isLong ? 'LONG' : 'SHORT'}</span>
-                            </td>
-                            <td style={{ padding: '8px 6px', textAlign: 'right', fontFamily: 'monospace', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
-                              ${parseFloat(t.entry_price || 0).toFixed(4)}
-                            </td>
-                            <td style={{ padding: '8px 6px', textAlign: 'right', fontFamily: 'monospace', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>
-                              {t.current_price ? `$${parseFloat(t.current_price).toFixed(4)}` : '—'}
-                            </td>
-                            <td style={{ padding: '8px 6px', textAlign: 'right', fontWeight: 800, fontFamily: 'monospace', color: pnlColor(pnl) }}>
-                              {sign(pnl)}${Math.abs(pnl).toFixed(2)}
-                            </td>
-                            <td style={{ padding: '8px 6px', textAlign: 'right', fontFamily: 'monospace', fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-                              {t.leverage ? `${t.leverage}×` : '—'}
-                            </td>
-                            <td style={{ padding: '8px 6px', textAlign: 'center' }}>
-                              <span style={{
-                                fontSize: 'var(--text-xs)', fontWeight: 700, padding: '2px 8px', borderRadius: 4,
-                                background: isActiveTrade ? 'var(--color-success-bg)' : 'rgba(107,114,128,0.12)',
-                                color: isActiveTrade ? 'var(--color-success)' : 'var(--color-text-muted)',
-                              }}>
-                                {isActiveTrade ? '● Active' : 'Closed'}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                  {trades.length > 20 && (
-                    <div style={{ textAlign: 'center', fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)', paddingTop: 10 }}>
-                      Showing 20 of {trades.length} trades
-                    </div>
-                  )}
-                </div>
-              )}
-              {tab === 'trades' && trades.length === 0 && (
-                <div style={{ padding: '28px', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
-                  No trades yet — start the bot to begin trading
-                </div>
-              )}
-
-              {/* Sessions tab */}
-              {tab === 'sessions' && sessions.length > 0 && (
-                <div style={{ padding: '4px 20px 16px' }}>
-                  {/* Header */}
-                  <div style={{
-                    display: 'grid', gridTemplateColumns: '1fr 80px 60px 90px 70px',
-                    gap: 8, padding: '8px 0', fontSize: 'var(--text-xs)', fontWeight: 700,
-                    color: 'var(--color-text-muted)', textTransform: 'uppercase', letterSpacing: '0.6px',
-                    borderBottom: '1px solid var(--color-border-subtle)',
-                  }}>
-                    <span>Session</span>
-                    <span style={{ textAlign: 'right' }}>Trades</span>
-                    <span style={{ textAlign: 'right' }}>Win%</span>
-                    <span style={{ textAlign: 'right' }}>PnL</span>
-                    <span style={{ textAlign: 'right' }}>ROI</span>
-                  </div>
-                  {sessions.map((s: any) => (
-                    <div key={s.id} style={{
-                      display: 'grid', gridTemplateColumns: '1fr 80px 60px 90px 70px',
-                      gap: 8, alignItems: 'center', padding: '9px 0',
-                      borderBottom: '1px solid var(--color-border-subtle)', fontSize: 'var(--text-sm)',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <span style={{
-                          fontSize: 'var(--text-xs)', fontWeight: 700, padding: '2px 7px', borderRadius: 4,
-                          ...(s.status === 'active'
-                            ? { background: 'var(--color-success-bg)', color: 'var(--color-success)' }
-                            : { background: 'rgba(107,114,128,0.12)', color: 'var(--color-text-muted)' }),
-                        }}>
-                          {s.status === 'active' ? '● Live' : `#${s.sessionIndex}`}
-                        </span>
-                        <span style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-muted)' }}>
-                          {fmtDate(s.startedAt)} · {fmtDuration(s.startedAt, s.endedAt)}
-                        </span>
-                      </div>
-                      <span style={{ textAlign: 'right', fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)' }}>{s.totalTrades}</span>
-                      <span style={{ textAlign: 'right', fontFamily: 'monospace', fontSize: 'var(--text-xs)', color: (s.winRate || 0) >= 50 ? 'var(--color-success)' : 'var(--color-text-muted)' }}>
-                        {s.closedTrades > 0 ? `${(s.winRate || 0).toFixed(0)}%` : '—'}
-                      </span>
-                      <span style={{ textAlign: 'right', fontFamily: 'monospace', fontWeight: 700, color: pnlColor(s.livePnl ?? s.totalPnl ?? 0) }}>
-                        {fmt(s.livePnl ?? s.totalPnl ?? 0)}
-                      </span>
-                      <span style={{ textAlign: 'right', fontFamily: 'monospace', fontSize: 'var(--text-xs)', color: pnlColor(s.liveRoi ?? s.roi ?? 0) }}>
-                        {fmt(s.liveRoi ?? s.roi ?? 0)}%
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {tab === 'sessions' && sessions.length === 0 && (
-                <div style={{ padding: '28px', textAlign: 'center', color: 'var(--color-text-muted)', fontSize: 'var(--text-sm)' }}>
-                  No sessions yet — start the bot to begin tracking
-                </div>
-              )}
             </div>
           </motion.div>
         )}

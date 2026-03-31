@@ -12,6 +12,8 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 TESTNET = os.getenv("TESTNET", "true").lower() == "true"
 PAPER_TRADE = os.getenv("PAPER_TRADE", "true").lower() == "true"
+PAPER_USE_MAINNET           = True      # Use Binance MAINNET prices for paper trades (fixes testnet price divergence)
+PAPER_SIMULATED_SLIPPAGE_PCT = 0.05     # ±0.05% simulated market slippage on paper fills
 ENGINE_USER_ID = "cmmbvbo2l0000j1xo3rqvkfhz"  # Default user for engine trades (admin)
 ENGINE_BOT_ID  = os.getenv("ENGINE_BOT_ID", "")    # DB Bot.id — set in Railway per deployment
 ENGINE_BOT_NAME = os.getenv("ENGINE_BOT_NAME", "") # Human-readable bot name shown in trades UI
@@ -40,20 +42,23 @@ SECONDARY_SYMBOLS = ["ETHUSDT"]
 
 # ─── Excluded Coins ─────────────────────────────────────────────────────────────
 # Coins placed here are completely ignored by the engine, scanner, and scanners.
-EXCLUDED_COINS = ["AKTUSDT", "WIFUSDT", "FILUSDT"]
+EXCLUDED_COINS = ["AKTUSDT", "WIFUSDT", "FILUSDT", "DIAUSDT", "BANDUSDT"]  # DIAUSDT/BANDUSDT: too illiquid on spot — constant PriceStream stale restarts
 
 # ─── Crypto Segments (for Segment-Level Analysis) ───────────────────────────────
 CRYPTO_SEGMENTS = {
-    "L1": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "SUIUSDT", "XRPUSDT", "APTUSDT", "ETCUSDT"],
-    "L2": ["ARBUSDT", "OPUSDT", "POLUSDT", "MNTUSDT", "STRKUSDT", "IMXUSDT", "RONINUSDT", "ZKUSDT"],
-    "DeFi": ["UNIUSDT", "AAVEUSDT", "CRVUSDT", "JUPUSDT", "RUNEUSDT", "PENDLEUSDT", "LINKUSDT", "LDOUSDT", "GMXUSDT", "ENAUSDT"],
-    "AI": ["TAOUSDT", "FETUSDT", "INJUSDT", "WLDUSDT", "AKTUSDT", "RENDERUSDT"],
-    "Meme": ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "1000PEPEUSDT", "1000SHIBUSDT"],
-    "RWA": ["ONDOUSDT", "POLYXUSDT", "TRUUSDT"],
-    "Gaming": ["AXSUSDT", "SANDUSDT", "PIXELUSDT", "IOTXUSDT"],
-    "DePIN": ["FILUSDT", "ARUSDT", "HNTUSDT"],
-    "Modular": ["TIAUSDT", "DYMUSDT"],
-    "Oracles": ["PYTHUSDT", "TRBUSDT", "API3USDT"]
+    "L1": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "SUIUSDT", "XRPUSDT", "APTUSDT", "ETCUSDT",
+           "ADAUSDT", "DOTUSDT", "NEARUSDT", "TRXUSDT", "BCHUSDT", "TONUSDT", "ICPUSDT"],  # KASUSDT removed — not on testnet
+    "L2": ["ARBUSDT", "OPUSDT", "POLUSDT", "STRKUSDT", "IMXUSDT", "RONINUSDT", "ZKUSDT",
+           "MANTAUSDT", "METISUSDT", "AXLUSDT"],   # MNTUSDT removed — not on Binance
+    "DeFi": ["UNIUSDT", "AAVEUSDT", "CRVUSDT", "JUPUSDT", "RUNEUSDT", "PENDLEUSDT", "LINKUSDT", "LDOUSDT", "GMXUSDT", "ENAUSDT",
+             "SUSHIUSDT", "COMPUSDT", "SNXUSDT", "CAKEUSDT", "GRTUSDT"],
+    "AI": ["TAOUSDT", "FETUSDT", "INJUSDT", "WLDUSDT", "AKTUSDT", "RENDERUSDT", "ARKMUSDT"],
+    "Meme": ["DOGEUSDT", "SHIBUSDT", "PEPEUSDT", "WIFUSDT", "BONKUSDT", "NOTUSDT", "MANAUSDT"],  # 1000X and MEWUSDT removed — not on testnet
+    "RWA": ["ONDOUSDT", "POLYXUSDT", "TRUUSDT", "RSRUSDT"],
+    "Gaming": ["AXSUSDT", "SANDUSDT", "PIXELUSDT", "IOTXUSDT", "GALAUSDT", "ENJUSDT", "YGGUSDT", "GLMUSDT"],
+    "DePIN": ["FILUSDT", "ARUSDT", "IOUSDT", "JTOUSDT"],          # HNTUSDT removed — not on Binance
+    "Modular": ["TIAUSDT", "DYMUSDT", "STXUSDT", "QNTUSDT", "ALTUSDT", "EIGENUSDT"],
+    "Oracles": ["PYTHUSDT", "TRBUSDT", "API3USDT", "HBARUSDT", "BANDUSDT", "DIAUSDT"]
 }
 
 # Apply exclusion filter immediately
@@ -67,9 +72,9 @@ TIMEFRAME_MACRO = "4h"        # Macro regime (legacy — replaced by Multi-TF HM
 
 # ─── Multi-Timeframe HMM (backtest-proven: +$2,421 PnL, PF 1.49) ────────────
 MULTI_TF_ENABLED = True               # Use 3 separate HMM brains per coin
-MULTI_TF_TIMEFRAMES = ["1d", "1h", "5m"]   # Daily (macro), Hourly (swing), 5min (momentum)
+MULTI_TF_TIMEFRAMES = ["4h", "1h", "15m"]  # 4h (trend anchor), 1h (swing), 15m (momentum trigger)
 MULTI_TF_CANDLE_LIMIT = 1000          # Candles per TF (1000 for GMMHMM depth limit)
-MULTI_TF_WEIGHTS = {"1d": 20, "1h": 50, "5m": 30}  # Conviction weights (sum=100)
+MULTI_TF_WEIGHTS = {"4h": 30, "1h": 45, "15m": 25}  # Conviction weights (sum=100)
 MULTI_TF_MIN_AGREEMENT = 2            # Minimum TFs agreeing on direction (2 of 3)
 MULTI_TF_MIN_MODELS = 2               # Minimum trained models required
 
@@ -104,7 +109,7 @@ HMM_N_STATES = 3              # Bull, Chop, Bear (3-state — CRASH merged into 
 HMM_COVARIANCE = "full"       # Optimized: captures cross-feature correlations
 HMM_ITERATIONS = 100
 HMM_LOOKBACK = 250            # Candles used for training (reduced for speed)
-HMM_RETRAIN_HOURS = 24        # Retrain every N hours
+HMM_RETRAIN_HOURS = 1         # Retrain every 1h — 1h TF gets 1 new bar, 15m TF gets 4 new bars
 
 # ─── Regime Labels (assigned post-training by sorting mean returns) ──────────
 REGIME_BULL = 0
@@ -136,13 +141,21 @@ CAPITAL_PER_TRADE = 100        # $100 per trade, fixed
 # ─── Risk Management ────────────────────────────────────────────────────────────
 RISK_PER_TRADE = 0.04
 KILL_SWITCH_DRAWDOWN = 0.10   # Pause bot if 10% drawdown in 24h
-MAX_LOSS_PER_TRADE_PCT = -20     # Hard max-loss per trade: -20% of capital (e.g. 20x lev → 1% price move)
+MAX_LOSS_PER_TRADE_PCT = -25     # Hard max-loss per trade: -25% of capital
 MIN_LEVERAGE_FLOOR = 5           # Skip trade if leverage must drop below this
 MIN_HOLD_MINUTES = 30         # Minimum hold time before regime-change exits
 DEFAULT_QUANTITY = 0.002      # BTC quantity (overridden by position sizer)
 MARGIN_TYPE = "ISOLATED"      # Never use CROSS for high leverage
 
 # ─── Stop Loss / Take Profit ────────────────────────────────────────────────────
+
+# Percentage-based partial profit booking (Trigger PnL %, Fraction_of_Remaining_Qty, Milestone_Name)
+PARTIAL_BOOKING_STEPS = [
+    ( 30.0, 0.33, "TP1" ),   # At +30% PnL: Sell ~33% of original position.
+    ( 60.0, 0.50, "TP2" ),   # At +60% PnL: Sell 50% of remaining (another ~33% of original).
+    (100.0, 1.00, "TP3" ),   # At +100% PnL: Sell the rest (Full Close).
+]
+
 ATR_SL_MULTIPLIER = 1.5       # SL = ATR * multiplier (DEFAULT, used as fallback)
 ATR_TP_MULTIPLIER = 3.0       # TP = ATR * multiplier (DEFAULT, used as fallback)
 SLIPPAGE_BUFFER = 0.0005      # 0.05% slippage estimate
@@ -165,20 +178,8 @@ def get_atr_multipliers(leverage=1):
 # Each step: (trigger_pnl_pct, lock_pnl_pct)
 #   When leveraged P&L >= trigger → move SL to lock that % profit
 #   lock 0% = breakeven (entry price)
-TRAILING_SL_ENABLED = True       # Enabled to lock in profit before reversion
-TRAILING_SL_STEPS = [
-    (5.0,   0.0),   # At +5%  leveraged P&L → SL to Breakeven
-    (10.0,  5.0),   # At +10% leveraged P&L → Lock +5% profit
-    (15.0, 10.0),   # At +15% leveraged P&L → Lock +10% profit
-    (20.0, 15.0),   # At +20% leveraged P&L → Lock +15% profit
-    (25.0, 20.0),   # At +25% leveraged P&L → Lock +20% profit
-    (30.0, 25.0),   # At +30% leveraged P&L → Lock +25% profit
-    (35.0, 30.0),   # At +35% leveraged P&L → Lock +30% profit
-    (40.0, 35.0),   # At +40% leveraged P&L → Lock +35% profit
-    (45.0, 40.0),   # At +45% leveraged P&L → Lock +40% profit
-    (50.0, 45.0),   # At +50% leveraged P&L → Lock +45% profit
-]
-# Legacy ATR trailing (kept for test compat — superseded by TRAILING_SL_STEPS)
+# Legacy ATR trailing (kept for test compat — superseded by TRAILING_SL_STEPS at line 265)
+
 TRAILING_SL_ACTIVATION_ATR = 1.0
 TRAILING_TP_MAX_EXTENSIONS = 3
 
@@ -206,12 +207,16 @@ SIDEWAYS_POSITION_REDUCTION = 0.30  # 30% smaller positions in chop
 
 # ─── Bot Loop ────────────────────────────────────────────────────────────────────
 LOOP_INTERVAL_SECONDS = 10        # 10-second heartbeat (faster trailing SL sync)
-ANALYSIS_INTERVAL_SECONDS = 900   # 15-minute full analysis cycle
+ANALYSIS_INTERVAL_SECONDS = 300   # 5-minute full analysis cycle
 ERROR_RETRY_SECONDS = 60          # Retry after error
 
 # Min HMM conviction to pass to Athena (below this, coin is skipped before Athena call)
 MIN_CONVICTION_FOR_DEPLOY = 65    # 65 out of 100 — matches MultiTFHMMBrain conviction scale (0-100)
 TOP_COINS_PER_SEGMENT = 1         # Athena evaluates the single highest-HMM coin per segment
+
+# ─── Deploy Waterfall ────────────────────────────────────────────────────────────
+ATHENA_WATERFALL_DEPTH = 4        # How many coins to send to Athena per bot (fallback if #1 vetoed)
+MAX_DEPLOYS_PER_BOT_PER_CYCLE = 3 # Deploy up to N coins per bot per cycle (prevents signal loss on segment rotation)
 
 # ─── Multi-Coin Trading ──────────────────────────────────────────────────────────
 MAX_CONCURRENT_POSITIONS = 10   # Max symbols traded at once (reduced from 15)
@@ -224,7 +229,7 @@ MULTI_COIN_MODE = True          # Enable multi-coin scanning
 # ─── Dynamic Segment Scanner ─────────────────────────────────────────────────────
 SCANNER_SEGMENT_ROTATION = True     # Rotate market segments every hour
 SCANNER_COINS_PER_SEGMENT = 5       # Scan top 5 highest-volume coins within the active segment
-SEGMENT_SCAN_LIMIT = 2              # Legacy: kept for get_hottest_segments() backwards compat
+SEGMENT_SCAN_LIMIT = 3              # Top N segments to scan per cycle (4h+1h blended scorer)
 
 # ── 3-Mode Macro-Regime-Aware Segment Selection ──────────────────────────────
 # The engine detects market mode each cycle and picks segment pools accordingly:
@@ -237,12 +242,43 @@ SEGMENT_SHORT_POOL_SIZE   = 2       # N worst segments used in BEARISH / MIXED m
 SEGMENT_LONG_POOL_SIZE    = 2       # N best segments used in BULLISH / MIXED mode
 MAX_ACTIVE_PER_SEGMENT = 1          # Correlation control: max 1 trade per segment
 
+# ── Segment filter master switch ─────────────────────────────────────────────
+# Set to True to re-enable the 3-mode macro-regime segment pre-filter and
+# direction gate. While False, the engine scans ALL coins in every cycle.
+USE_SEGMENT_FILTER = True
+
+# ── Multi-Timeframe Market Mode Confirmation ─────────────────────────────────
+# Prevents false BULLISH/BEARISH locks at swing highs, fake breakouts, reversals.
+# Requires 3 timeframes to agree before committing to a directional mode.
+# If any shorter frame disagrees with 24h → stays MIXED (both directions allowed).
+# Set SEGMENT_MTF_ENABLED = False to revert to legacy 24h-only behaviour instantly.
+SEGMENT_MTF_ENABLED      = True   # Enable 3-frame mode confirmation
+SEGMENT_MTF_4H_TF        = "4h"  # Swing-level candle interval (per-segment top coin)
+SEGMENT_MTF_1H_TF        = "1h"  # Intraday BTC gate candle interval
+
+# ── Stepped Trailing SL (Profit Lock) ────────────────────────────────────────
+# Controls the stepped breakeven + profit-lock ratchet in tradebook.update_unrealized().
+# Each tuple: (trigger_leveraged_pnl_pct, lock_leveraged_pnl_pct)
+#   trigger = position must reach this % leveraged PnL before step activates
+#   lock    = SL is moved to lock in this % of leveraged PnL (0 = breakeven)
+#
+# UI labels (trades-client.tsx): Breakeven, +5%, +10%, +15%...
+TRAILING_SL_ENABLED = True
+TRAILING_SL_STEPS = [
+    (15.0,  4.0),   # 1: Trigger at +15% → Move SL to Breakeven (+4%). Trade is now risk-free.
+    (25.0,  10.0),   # 2: Trigger at +25% → Lock +10% (Gives 20% breathing room for pullbacks)
+    (35.0, 15.0),   # 3: Trigger at +35% → Lock +15%
+    (45.0, 25.0),   # 4: Trigger at +45% → Lock +25%
+    (60.0, 40.0),   # 5: Trigger at +60% → Lock +40%
+]
+
+
 
 
 # ─── Telegram Notifications ──────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_ENABLED = False
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
 TELEGRAM_NOTIFY_TRADES = os.getenv("TELEGRAM_NOTIFY_TRADES", "true").lower() == "true"
 TELEGRAM_NOTIFY_ALERTS = os.getenv("TELEGRAM_NOTIFY_ALERTS", "true").lower() == "true"
 TELEGRAM_NOTIFY_SUMMARY = os.getenv("TELEGRAM_NOTIFY_SUMMARY", "true").lower() == "true"
@@ -266,18 +302,49 @@ SENTIMENT_VETO_THRESHOLD    = -0.65    # Hard veto gate (fast path before convic
 SENTIMENT_STRONG_POS        = 0.45     # Threshold for "strongly positive" label
 SENTIMENT_USE_FINBERT       = False    # DISABLED — FinBERT loads ~400MB transformer model (OOM on Railway)
 SENTIMENT_VADER_WEIGHT      = 0.4      # VADER contribution when blending with FinBERT
-# ─── Athena — LLM Reasoning Layer (Gemini) ────────────────────────────────────
+# ─── Athena — LLM Reasoning Layer (OpenAI ChatGPT) ───────────────────────────
 # Strategic AI brain that validates HMM signals using contextual reasoning.
 # Acts as a "risk committee" — can EXECUTE, REDUCE_SIZE, or VETO trades.
 LLM_REASONING_ENABLED       = True
-LLM_API_KEY                 = os.getenv("GEMINI_API_KEY", "")
-LLM_MODEL                   = "gemini-2.5-flash"          # Latest available flash model
-LLM_CACHE_MINUTES           = 10                          # Cache per-coin LLM decisions
-LLM_TIMEOUT_SECONDS         = 30                          # Includes Google Search grounding time
-LLM_VETO_THRESHOLD          = 0.30                        # Below this → LLM vetoes the trade
-LLM_CONFIDENCE_WEIGHT       = 0.20                        # LLM can adjust conviction by ±20%
-LLM_MAX_CALLS_PER_CYCLE     = 10                          # Rate limit: max N Athena calls per cycle (fail-closed when exceeded)
+LLM_API_KEY                 = os.getenv("GEMINI_API_KEY", "")  # Env var name unchanged — now holds OpenAI key
+LLM_MODEL                   = "gpt-4o"                         # Strongest reasoning, excellent JSON adherence
+LLM_CACHE_MINUTES           = 10                               # Cache per-coin LLM decisions
+LLM_TIMEOUT_SECONDS         = 30                               # API timeout
+LLM_VETO_THRESHOLD          = 0.80                             # Below this → LLM vetoes the trade (raised from 0.65)
+BTC_MACRO_COUNTER_THRESHOLD = 0.80                             # Counter-macro trades need ≥80% Athena conf (LONG in bearish / SHORT in bullish)
+LLM_CONFIDENCE_WEIGHT       = 0.20                             # LLM can adjust conviction by ±20%
+LLM_MAX_CALLS_PER_CYCLE     = 10                               # Rate limit: max N Athena calls per cycle
 LLM_LOG_FILE                = os.path.join(DATA_DIR, "athena_decisions.json")
+
+# ─── Coin Cooldown (anti-churn, anti-revenge-trade) ──────────────────────────
+# Prevents immediate redeployment after a trade closes on the same coin.
+# Cooldowns are stored in-memory (reset on engine restart) and visible in Brain Summary.
+COOLDOWN_ENABLED            = True    # Master switch — set False to bypass all rules
+COOLDOWN_SL_MINUTES         = 90     # Rule 1: SL / trailing-SL / max-loss exit
+COOLDOWN_LOSS_MINUTES       = 45     # Rule 2: any loss close (non-SL)
+COOLDOWN_FLASH_CLOSE_MIN    = 120    # Rule 3: loss close AND held < COOLDOWN_FLASH_HOLD_THRESH
+COOLDOWN_SAME_DIR_MINUTES   = 30     # Rule 4: same direction as last trade (same session)
+COOLDOWN_DAILY_CAP_TRADES   = 3      # Rule 5: max deployments per coin per rolling 24h
+COOLDOWN_FLASH_HOLD_THRESH  = 15     # minutes — what counts as a "flash close"
+
+# ─── Segment Cooldown (anti-correlation, anti-drawdown) ──────────────────────
+# Prevents redeployment into a segment experiencing correlated drawdowns.
+# Works alongside coin-level cooldowns — checked BEFORE coin cooldown at deploy gate.
+SEG_COOLDOWN_ENABLED          = True
+SEG_COOLDOWN_SL_BURST_COUNT   = 2     # Rule 1: ≥N SLs in same segment within window → block
+SEG_COOLDOWN_SL_BURST_WINDOW  = 60    # minutes — sliding window for Rule 1
+SEG_COOLDOWN_SL_BURST_MINS    = 90    # cooldown duration for Rule 1
+SEG_COOLDOWN_LOSS_RATE_PCT    = 60    # Rule 2: ≥N% of closes are losses (4h window, min 3 trades)
+SEG_COOLDOWN_LOSS_RATE_MINS   = 120   # cooldown duration for Rule 2
+SEG_COOLDOWN_MAX_ACTIVE       = 3     # Rule 3: max concurrent active positions per segment (hard cap)
+SEG_COOLDOWN_CHURN_COUNT      = 4     # Rule 4: ≥N opens in same segment within window → block
+SEG_COOLDOWN_CHURN_WINDOW     = 360   # minutes (6h) — sliding window for Rule 4
+SEG_COOLDOWN_CHURN_MINS       = 180   # cooldown duration for Rule 4
+SEG_COOLDOWN_CONSEC_LOSS      = 3     # Rule 5: N consecutive losses from segment → block
+SEG_COOLDOWN_CONSEC_LOSS_MINS = 240   # cooldown duration for Rule 5
+
+
+
 
 
 

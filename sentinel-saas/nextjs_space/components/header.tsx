@@ -68,15 +68,22 @@ export function Header() {
                     Deploy
                   </Link>
                   <Link href="/trades" className="text-[17px] font-medium text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors">
-                    Trade Book
+                    Paper Trade
                   </Link>
-                  <Link href="/account" className="text-[17px] font-medium text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors">
-                    Account
+                  <Link href="/live" className="text-[17px] font-semibold flex items-center gap-1.5 transition-colors" style={{ color: '#EF4444', textShadow: '0 0 8px rgba(239,68,68,0.35)' }}>
+                    <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', background: '#EF4444', boxShadow: '0 0 6px #EF4444', animation: 'pulse 1.5s ease-in-out infinite' }} />
+                    Live Trade
                   </Link>
+
                   {(session.user as any)?.role === 'admin' && (
-                    <Link href="/admin" className="text-amber-400 hover:text-amber-300 transition-colors">
-                      Admin
-                    </Link>
+                    <>
+                      <Link href="/admin" className="text-amber-400 hover:text-amber-300 transition-colors">
+                        Admin
+                      </Link>
+                      <Link href="/admin/segment-intelligence" className="text-amber-400 hover:text-amber-300 transition-colors" style={{ fontSize: 13 }}>
+                        🌐 Intel
+                      </Link>
+                    </>
                   )}
                   {/* Bell icon */}
                   {session && (
@@ -104,9 +111,17 @@ export function Header() {
                   )}
                   {session && (
                     <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginLeft: '12px' }}>
-                      <span style={{ fontSize: '13px', fontWeight: 600, color: '#00E5FF' }}>
+                      <Link
+                        href="/account"
+                        style={{
+                          fontSize: '13px', fontWeight: 600, color: '#00E5FF',
+                          textDecoration: 'none', cursor: 'pointer',
+                          transition: 'opacity 0.2s',
+                        }}
+                        title="Account Settings"
+                      >
                         {(session.user as any)?.name || 'User'} {((session.user as any)?.role === 'admin') ? '(Admin)' : ''}
-                      </span>
+                      </Link>
                       <button
                         onClick={handleSignOut}
                         className="p-2 text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] hover:bg-[var(--color-primary)]/10 rounded-lg transition-all"
@@ -152,11 +167,16 @@ export function Header() {
                     Deploy
                   </Link>
                   <Link href="/trades" className="block text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors">
-                    Trade Book
+                    Paper Trade
                   </Link>
-                  <Link href="/account" className="block text-[var(--color-text-secondary)] hover:text-[var(--color-primary)] transition-colors">
-                    Account
+                  <Link href="/live" className="block font-semibold transition-colors" style={{ color: '#EF4444' }}>
+                    ● Live Trade
                   </Link>
+
+                  <Link href="/account" className="block font-semibold transition-colors" style={{ color: '#00E5FF' }}>
+                    {(session.user as any)?.name || 'Account'}
+                  </Link>
+
                   <button
                     onClick={handleSignOut}
                     className="w-full text-left px-4 py-2 bg-[var(--color-danger)] text-white rounded-lg hover:opacity-90 transition-opacity"

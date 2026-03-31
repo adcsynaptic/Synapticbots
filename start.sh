@@ -3,6 +3,11 @@
 # Starts the Next.js SaaS dashboard. The Python bot engine is started
 # via the "Start Engine" button on the dashboard (spawns main.py).
 
+# for local run use the following command:
+# docker build -t synapticbots:local .
+# docker run --rm -it -p 3000:3000 -v /home/adc/synaptic/nikhil_crypto/Synapticbots/data:/app/data --name synapticbots synapticbots:local
+
+
 set -e
 
 echo "🚀 Starting SENTINEL Dashboard..."

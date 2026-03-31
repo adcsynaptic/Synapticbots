@@ -1,0 +1,23 @@
+{
+  "expo": {
+    "name": "Synaptic Mobile",
+    "slug": "synaptic-mobile",
+    "scheme": "synapticmobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "plugins": [
+      "expo-secure-store",
+      "expo-asset",
+      "@sentry/react-native"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.synaptic.mobile"
+    },
+    "extra": {
+      "apiBaseUrl": "http://localhost:3000"
+    }
+  }
+}

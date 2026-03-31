@@ -5,22 +5,37 @@ import { GOD_REFERRAL_CODE } from '@/lib/subscription-limits';
 
 export const dynamic = 'force-dynamic';
 
+function withCorsHeaders(response: NextResponse) {
+  response.headers.set('Access-Control-Allow-Origin', '*');
+  response.headers.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  return response;
+}
+
+export async function OPTIONS() {
+  return withCorsHeaders(new NextResponse(null, { status: 204 }));
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const { email, password, confirmPassword, name, referralCode, phone } = body;
 
     if (!email || !password || !name) {
-      return NextResponse.json(
-        { error: 'Missing required fields' },
-        { status: 400 }
+      return withCorsHeaders(
+        NextResponse.json(
+          { error: 'Missing required fields' },
+          { status: 400 }
+        )
       );
     }
 
     if (password !== confirmPassword) {
-      return NextResponse.json(
-        { error: 'Passwords do not match' },
-        { status: 400 }
+      return withCorsHeaders(
+        NextResponse.json(
+          { error: 'Passwords do not match' },
+          { status: 400 }
+        )
       );
     }
 
@@ -29,9 +44,11 @@ export async function POST(request: Request) {
     });
 
     if (existingUser) {
-      return NextResponse.json(
-        { error: 'Email already exists' },
-        { status: 400 }
+      return withCorsHeaders(
+        NextResponse.json(
+          { error: 'Email already exists' },
+          { status: 400 }
+        )
       );
     }
 
@@ -76,18 +93,22 @@ export async function POST(request: Request) {
       });
     }
 
-    return NextResponse.json(
-      {
-        message: 'User created successfully',
-        user: { id: user.id, email: user.email, name: user.name },
-      },
-      { status: 201 }
+    return withCorsHeaders(
+      NextResponse.json(
+        {
+          message: 'User created successfully',
+          user: { id: user.id, email: user.email, name: user.name },
+        },
+        { status: 201 }
+      )
     );
   } catch (error: any) {
     console.error('Signup error:', error);
-    return NextResponse.json(
-      { error: 'Something went wrong' },
-      { status: 500 }
+    return withCorsHeaders(
+      NextResponse.json(
+        { error: 'Something went wrong' },
+        { status: 500 }
+      )
     );
   }
 }

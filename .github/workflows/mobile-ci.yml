@@ -1,0 +1,26 @@
+name: Mobile CI
+
+on:
+  push:
+    paths:
+      - 'mobile-app/**'
+      - 'packages/shared/**'
+      - 'sentinel-saas/nextjs_space/app/api/mobile/**'
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: /home/adc/synaptic/nikhil_crypto/Synapticbots/mobile-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+

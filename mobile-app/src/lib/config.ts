@@ -5,6 +5,14 @@ export function getApiBaseUrl() {
   const fromEnv = process.env.EXPO_PUBLIC_API_BASE_URL;
   if (fromEnv) return fromEnv;
 
+  // app.json can provide a production/staging URL.
+  // Prefer it over Expo debuggerHost auto-detection because physical devices
+  // often cannot reach the debugger host IP.
+  const extra = (Constants.expoConfig?.extra || {}) as { apiBaseUrl?: string };
+  if (extra.apiBaseUrl && !/localhost|127\.0\.0\.1/.test(extra.apiBaseUrl)) {
+    return extra.apiBaseUrl;
+  }
+
   // Dev fallback for physical devices:
   // derive the host IP from Expo debugger host (e.g. 192.168.1.15:19000)
   // and point API requests to your local backend on port 3000.
@@ -17,13 +25,6 @@ export function getApiBaseUrl() {
   if (debuggerHost) {
     const host = String(debuggerHost).split(':')[0];
     if (host) return `http://${host}:3000`;
-  }
-
-  // app.json can provide a production/staging URL. Ignore localhost-like
-  // values here because they break Android devices in Expo Go.
-  const extra = (Constants.expoConfig?.extra || {}) as { apiBaseUrl?: string };
-  if (extra.apiBaseUrl && !/localhost|127\.0\.0\.1/.test(extra.apiBaseUrl)) {
-    return extra.apiBaseUrl;
   }
 
   if (Platform.OS === 'android') {

@@ -16,11 +16,14 @@ async function refreshTokens(refreshToken: string) {
 
 async function request<T>(path: string, init?: RequestInit, attempt = 0): Promise<T> {
   const { accessToken, refreshToken, setTokens, clear } = useAuthStore.getState();
+  const baseUrl = getApiBaseUrl();
+  // Helps debugging on device: confirms which backend URL the app is actually calling.
+  console.log('[api] baseUrl=', baseUrl, 'path=', path);
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
 
-  const res = await fetch(`${getApiBaseUrl()}${path}`, {
+  const res = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers: { ...headers, ...(init?.headers as Record<string, string> | undefined) },
   });
@@ -91,5 +94,6 @@ export const mobileApi = {
     request<{ symbol: string; interval: string; candles: any[] }>(
       `/api/mobile/v1/market/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`
     ),
+  marketSegments: () => request<{ segments: any[] }>(`/api/mobile/v1/market/segments`),
   engineStatus: () => request<any>('/api/mobile/v1/engine/status'),
 };

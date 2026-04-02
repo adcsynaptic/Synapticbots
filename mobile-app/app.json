@@ -14,7 +14,8 @@
       "supportsTablet": true
     },
     "android": {
-      "package": "com.synaptic.mobile"
+      "package": "com.synaptic.mobile",
+      "usesCleartextTraffic": true
     },
     "extra": {
       "apiBaseUrl": "http://35.154.138.233:3000"

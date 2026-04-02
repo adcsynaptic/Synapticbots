@@ -21,6 +21,8 @@ export function LoginScreen() {
       const res = await mobileLogin(email, password);
       await setTokens(res.accessToken, res.refreshToken);
     } catch (err: any) {
+      // Surface the real network error so we can distinguish CORS/cleartext/URL issues.
+      console.error('Login error:', err);
       Alert.alert('Login failed', err?.message || 'Unknown error');
     } finally {
       setLoading(false);

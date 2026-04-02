@@ -17,7 +17,7 @@
       "package": "com.synaptic.mobile"
     },
     "extra": {
-      "apiBaseUrl": "http://localhost:3000"
+      "apiBaseUrl": "http://35.154.138.233:3000"
     }
   }
 }

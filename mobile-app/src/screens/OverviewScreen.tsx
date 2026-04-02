@@ -198,7 +198,7 @@ export function OverviewScreen() {
               <Text style={[styles.sectionTitle, { color: colors.text }]}>Segments</Text>
               <View style={styles.heatGrid}>
                 {segQ.data.segments.map((s: any, i: number) => {
-                  const v = Number(s.roi_24h || s.change_24h || 0);
+                  const v = Number.isFinite(Number(s.value)) ? Number(s.value) : Number(s.roi_24h || s.change_24h || 0);
                   const bg = colorForDelta(v);
                   return (
                     <View key={i} style={[styles.heatCell, { backgroundColor: bg, borderColor: 'rgba(255,255,255,0.06)' }]}>

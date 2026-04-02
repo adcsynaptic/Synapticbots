@@ -12,7 +12,14 @@ export async function GET() {
     const res = await fetch(`${url}/api/all`, { cache: 'no-store', signal: AbortSignal.timeout(7000), headers });
     if (!res.ok) return mobileOk({ segments: [] });
     const data = await res.json();
-    const segments = Array.isArray(data?.heatmap?.segments) ? data.heatmap.segments : [];
+    const raw = Array.isArray(data?.heatmap?.segments) ? data.heatmap.segments : [];
+    const segments = raw.map((s: any) => {
+      const name = s?.name ?? s?.segment ?? 'SEG';
+      const cand = s?.roi_24h ?? s?.change_24h ?? s?.roi ?? s?.delta ?? 0;
+      const num = Number(String(cand).toString().replace('%', ''));
+      const value = Number.isFinite(num) ? num : 0;
+      return { name, value };
+    });
     return mobileOk({ segments });
   } catch {
     return mobileOk({ segments: [] });

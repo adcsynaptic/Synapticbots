@@ -16,6 +16,7 @@ export function OverviewScreen() {
   const engine = useQuery({ queryKey: ['engine-status'], queryFn: mobileApi.engineStatus, refetchInterval: 15000 });
   const positionsQ = useQuery({ queryKey: ['positions-mini'], queryFn: mobileApi.positions, refetchInterval: 15000 });
   const marketQ = useQuery({ queryKey: ['market-kpis'], queryFn: mobileApi.market, refetchInterval: 15000 });
+  const cockpitQ = useQuery({ queryKey: ['cockpit'], queryFn: mobileApi.cockpit, refetchInterval: 15000 });
 
   const stats = data?.stats;
   const wallet = data?.wallet;
@@ -109,6 +110,25 @@ export function OverviewScreen() {
                 <View style={{ alignItems: 'center', marginBottom: 6 }}>
                   <RegimeGauge confidence={Number(engine.data?.state?.confidence || 0)} />
                 </View>
+                {/* Brain Execution Summary counters */}
+                <View style={styles.besRow}>
+                  <View style={[styles.besCard, { borderColor: glassBorder, backgroundColor: glassBg }]}>
+                    <Text style={[styles.besLabel, { color: colors.textSecondary }]}>SCANNED</Text>
+                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.scanned ?? Object.keys(coinStates).length}</Text>
+                  </View>
+                  <View style={[styles.besCard, { borderColor: glassBorder, backgroundColor: glassBg }]}>
+                    <Text style={[styles.besLabel, { color: colors.textSecondary }]}>IN POOL</Text>
+                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.inPool ?? Number(multi?.coins_scanned ?? Object.keys(coinStates).length)}</Text>
+                  </View>
+                  <View style={[styles.besCard, { borderColor: glassBorder, backgroundColor: glassBg }]}>
+                    <Text style={[styles.besLabel, { color: colors.textSecondary }]}>QUALIFIED</Text>
+                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.qualified ?? Number(multi?.eligible_count ?? 0)}</Text>
+                  </View>
+                  <View style={[styles.besCard, { borderColor: glassBorder, backgroundColor: glassBg }]}>
+                    <Text style={[styles.besLabel, { color: colors.textSecondary }]}>QUEUED</Text>
+                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.queued ?? Number(athena?.athenaRecentDecisions?.length ?? 0)}</Text>
+                  </View>
+                </View>
                 <Row label="Cycle" value={String(engineSnap?.cycle ?? '—')} color={colors.text} />
                 <Row label="Coins Scanned" value={String(engineSnap?.coinsScanned ?? '—')} color={colors.text} />
                 <Row label="Last Analysis" value={engineSnap?.lastAnalysisTime ?? '—'} color={colors.text} />
@@ -136,6 +156,19 @@ export function OverviewScreen() {
           {athena?.athenaRecentDecisions?.length ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
               <Text style={[styles.sectionTitle, { color: colors.text }]}>Athena Predictions</Text>
+              {/* Signal Queue — Athena-approved, awaiting deploy */}
+              <View style={[styles.queueBox, { borderColor: glassBorder, backgroundColor: 'rgba(255,255,255,0.02)' }]}>
+                <Text style={[styles.queueTitle, { color: colors.textSecondary }]}>Signal Queue</Text>
+                {athena.athenaRecentDecisions.slice(0, 6).map((q: any, i: number) => (
+                  <View key={i} style={styles.queueRow}>
+                    <Text style={[styles.queueSym, { color: colors.text }]}>{String(q.symbol || '').toUpperCase()}</Text>
+                    <Text style={[styles.queueSide, { color: (String(q.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>
+                      {String(q.side || '').toUpperCase() || '—'}
+                    </Text>
+                    <Text style={[styles.queueConv, { color: colors.textSecondary }]}>{q.conviction != null ? `${Math.round(Number(q.conviction) * 100)}%` : (q.confidence != null ? `${Math.round(Number(q.confidence))}%` : '')}</Text>
+                  </View>
+                ))}
+              </View>
               {athena.athenaRecentDecisions.map((d: any, i: number) => (
                 <View key={i} style={styles.predRow}>
                   <Text style={[styles.predSymbol, { color: colors.text }]}>{String(d.symbol || '').toUpperCase()}</Text>
@@ -193,11 +226,11 @@ export function OverviewScreen() {
           ) : null}
 
           {/* Segment Heatmap Grid */}
-          {Array.isArray(segQ.data?.segments) && segQ.data.segments.length ? (
+          {Array.isArray((cockpitQ.data?.segments || segQ.data?.segments)) && (cockpitQ.data?.segments || segQ.data?.segments)?.length ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
               <Text style={[styles.sectionTitle, { color: colors.text }]}>Segments</Text>
               <View style={styles.heatGrid}>
-                {segQ.data.segments.map((s: any, i: number) => {
+                {(cockpitQ.data?.segments || segQ.data?.segments)?.map((s: any, i: number) => {
                   const v = Number.isFinite(Number(s.value)) ? Number(s.value) : Number(s.roi_24h || s.change_24h || 0);
                   const bg = colorForDelta(v);
                   return (
@@ -383,6 +416,20 @@ const styles = StyleSheet.create({
   msCard: { borderWidth: 1, borderRadius: 12, padding: 12, width: '48%' },
   msTitle: { fontSize: 11, fontWeight: '700', textTransform: 'uppercase', marginBottom: 6 },
   msValue: { fontSize: 18, fontWeight: '800' },
+
+  // Brain Execution Summary counters
+  besRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 as any, marginBottom: 6 },
+  besCard: { borderWidth: 1, borderRadius: 12, paddingVertical: 10, paddingHorizontal: 12, alignItems: 'center', flex: 1 },
+  besLabel: { fontSize: 10, fontWeight: '800', textTransform: 'uppercase' },
+  besValue: { fontSize: 20, fontWeight: '800' },
+
+  // Signal queue
+  queueBox: { borderWidth: 1, borderRadius: 10, padding: 10, marginBottom: 8 },
+  queueTitle: { fontSize: 12, fontWeight: '800', marginBottom: 6 },
+  queueRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 },
+  queueSym: { fontSize: 12, fontWeight: '800', width: 70 },
+  queueSide: { fontSize: 12, fontWeight: '800', width: 54, textAlign: 'right' },
+  queueConv: { fontSize: 11, fontWeight: '700', flex: 1, textAlign: 'right' },
   quickActions: { borderWidth: 1, borderRadius: 14, padding: 14 },
   actionGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 as any, marginTop: 8 },
   actionBtn: {

@@ -96,4 +96,15 @@ export const mobileApi = {
     ),
   marketSegments: () => request<{ segments: any[] }>(`/api/mobile/v1/market/segments`),
   engineStatus: () => request<any>('/api/mobile/v1/engine/status'),
+  cockpit: () =>
+    request<{
+      scanned: number;
+      inPool: number;
+      qualified: number;
+      queued: number;
+      signalQueue: any[];
+      segments: { name: string; value: number }[];
+      perBot: Record<string, any>;
+      recentTrades: any[];
+    }>('/api/mobile/v1/dashboard/cockpit'),
 };

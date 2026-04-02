@@ -87,5 +87,9 @@ export const mobileApi = {
   positions: () => request<any>('/api/mobile/v1/dashboard/positions'),
   performance: () => request<any>('/api/mobile/v1/dashboard/performance'),
   market: () => request<any>('/api/mobile/v1/market/live'),
+  marketCandles: (symbol: string, interval: string, limit: number) =>
+    request<{ symbol: string; interval: string; candles: any[] }>(
+      `/api/mobile/v1/market/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${limit}`
+    ),
   engineStatus: () => request<any>('/api/mobile/v1/engine/status'),
 };

@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: synapticbots-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: synaptic
+      POSTGRES_USER: synaptic
+      POSTGRES_PASSWORD: synaptic
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synaptic -d synaptic"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synapticbots
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - ./proper.env
+    command: >
+      /bin/sh -c "cd /app/sentinel-saas/nextjs_space &&
+      npx prisma db push &&
+      /app/start.sh"
+
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: synapticbots-engine
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - ./proper.env
+    environment:
+      PORT: 3004
+      # Defaults in config.py already run paper-mode simulation (PAPER_TRADE=true)
+      # so this engine is safe for local web/mobile testing.
+      PAPER_TRADE: "true"
+    ports:
+      - "3004:3004"
+    command: >
+      /bin/sh -c "python /app/engine_api.py"
+
+volumes:
+  pgdata:

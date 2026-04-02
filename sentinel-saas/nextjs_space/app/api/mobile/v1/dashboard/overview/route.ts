@@ -12,16 +12,18 @@ export async function GET() {
     where: { id: mobileUser.id },
     include: {
       bots: { select: { id: true, isActive: true } },
-      trades: {
-        orderBy: { entryTime: 'desc' },
-        take: 100,
-      },
     },
   });
   if (!user) return mobileError('UNAUTHORIZED', 'User not found', 401);
 
-  const activeTrades = user.trades.filter((t) => (t.status || '').toLowerCase() === 'active');
-  const closedTrades = user.trades.filter((t) => (t.status || '').toLowerCase() === 'closed');
+  const trades = await prisma.trade.findMany({
+    where: { bot: { userId: user.id } },
+    orderBy: { entryTime: 'desc' },
+    take: 100,
+  });
+
+  const activeTrades = trades.filter((t) => (t.status || '').toLowerCase() === 'active');
+  const closedTrades = trades.filter((t) => (t.status || '').toLowerCase() === 'closed');
   const totalPnl =
     closedTrades.reduce((sum, t) => sum + (t.totalPnl || 0), 0) +
     activeTrades.reduce((sum, t) => sum + (t.activePnl || 0), 0);
@@ -32,7 +34,7 @@ export async function GET() {
       activeBots: user.bots.filter((b) => b.isActive).length,
       totalBots: user.bots.length,
       activeTrades: activeTrades.length,
-      totalTrades: user.trades.length,
+      totalTrades: trades.length,
       totalPnl,
     },
     wallet: {

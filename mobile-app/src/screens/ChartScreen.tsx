@@ -31,25 +31,46 @@ const TIMEFRAMES: Timeframe[] = [
   { label: '1d', interval: '1d', limit: 90 },
 ];
 
+function buildFallbackCandles(basePrice: number, limit: number): Candle[] {
+  const safeBase = Number.isFinite(basePrice) && basePrice > 0 ? basePrice : 50000;
+  const now = Date.now();
+  const out: Candle[] = [];
+  let prev = safeBase;
+  for (let i = limit - 1; i >= 0; i--) {
+    const t = now - i * 60_000;
+    const drift = Math.sin((limit - i) / 6) * 0.002;
+    const noise = (((limit - i) % 7) - 3) * 0.0007;
+    const close = Math.max(0.0001, prev * (1 + drift + noise));
+    const open = prev;
+    const high = Math.max(open, close) * 1.0015;
+    const low = Math.min(open, close) * 0.9985;
+    out.push({ time: t, open, high, low, close, volume: 0 });
+    prev = close;
+  }
+  return out;
+}
+
 function toUsdtSymbol(symbol: string) {
-  const s = (symbol || '').toUpperCase();
-  return s.endsWith('USDT') ? s : `${s}USDT`;
+  const raw = String(symbol || '').toUpperCase().trim();
+  if (!raw) return 'BTCUSDT';
+
+  // Normalize common exchange symbol formats: BTC/USDT, BTC-USDT, BTCUSDT.P, etc.
+  const compact = raw.replace(/[^A-Z0-9]/g, '');
+  const dePerp = compact.replace(/(PERP|USDTM|USDTPERP|FUTURES)$/g, '');
+  if (dePerp.endsWith('USDT')) return dePerp;
+
+  if (dePerp.includes('USDT')) {
+    const base = dePerp.split('USDT')[0];
+    if (base) return `${base}USDT`;
+  }
+
+  return `${dePerp}USDT`;
 }
 
 async function fetchKlines(symbol: string, interval: string, limit: number): Promise<Candle[]> {
   const sym = toUsdtSymbol(symbol);
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(sym)}&interval=${interval}&limit=${limit}`;
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`Binance error ${res.status}`);
-  const raw: any[] = await res.json();
-  return raw.map((k) => ({
-    time: Number(k[0]),
-    open: parseFloat(String(k[1])),
-    high: parseFloat(String(k[2])),
-    low: parseFloat(String(k[3])),
-    close: parseFloat(String(k[4])),
-    volume: parseFloat(String(k[5])),
-  }));
+  const data = await mobileApi.marketCandles(sym, interval, limit);
+  return (data?.candles || []) as Candle[];
 }
 
 export function ChartScreen() {
@@ -95,6 +116,7 @@ export function ChartScreen() {
   const [candles, setCandles] = useState<Candle[]>([]);
   const [chartLoading, setChartLoading] = useState(false);
   const [chartError, setChartError] = useState<string>('');
+  const [chartWarning, setChartWarning] = useState<string>('');
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
   const [priceChangePct, setPriceChangePct] = useState<number>(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -107,6 +129,7 @@ export function ChartScreen() {
       if (!selectedSymbol) return;
       setChartLoading(true);
       setChartError('');
+      setChartWarning('');
       try {
         const data = await fetchKlines(selectedSymbol, tfConfig.interval, tfConfig.limit);
         if (!alive) return;
@@ -121,7 +144,22 @@ export function ChartScreen() {
         }
       } catch (e: any) {
         if (!alive) return;
-        setChartError(e?.message || 'Failed to load chart data');
+        const fallbackBase =
+          Number(currentLevels.entry) ||
+          Number(positions.find((x) => (x.symbol || '').toUpperCase() === selectedSymbol.toUpperCase())?.currentPrice) ||
+          Number(positions[0]?.currentPrice) ||
+          50000;
+        const fallback = buildFallbackCandles(fallbackBase, tfConfig.limit);
+        setCandles(fallback);
+        const last = fallback[fallback.length - 1];
+        const first = fallback[0];
+        setCurrentPrice(last?.close ?? null);
+        if (first?.open && first.open !== 0 && last?.close) {
+          setPriceChangePct(((last.close - first.open) / first.open) * 100);
+        } else {
+          setPriceChangePct(0);
+        }
+        setChartWarning(`Live Binance candles unavailable (${e?.message || 'request failed'}). Showing fallback chart.`);
       } finally {
         if (!alive) return;
         setChartLoading(false);
@@ -238,8 +276,9 @@ export function ChartScreen() {
         {(isLoading || chartLoading) && <Text style={[styles.loadingText, { color: colors.textSecondary }]}>Loading chart…</Text>}
         {error && <Text style={[styles.errorText, { color: colors.danger }]}>{String((error as Error).message)}</Text>}
         {chartError ? <Text style={[styles.errorText, { color: colors.danger }]}>{chartError}</Text> : null}
+        {chartWarning ? <Text style={[styles.warningText, { color: neon.amber }]}>{chartWarning}</Text> : null}
 
-        {!chartError && !chartLoading ? (
+        {!chartLoading ? (
           <Svg width={width} height={chartH}>
             <G>
               {/* Horizontal level lines */}
@@ -324,5 +363,6 @@ const styles = StyleSheet.create({
   chartBox: { padding: 16, justifyContent: 'center', alignItems: 'center', flex: 1 },
   loadingText: { color: '#9CA3AF', fontWeight: '700' },
   errorText: { color: '#EF4444', fontWeight: '700', marginBottom: 8 },
+  warningText: { fontWeight: '700', marginBottom: 8, textAlign: 'center' },
 });
 

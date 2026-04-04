@@ -28,13 +28,23 @@ function AppTabs() {
     <View style={{ flex: 1 }}>
       <CoinsTickerBar />
       <View style={{ flex: 1 }}>
-        <Tab.Navigator screenOptions={{ headerShown: false }}>
-          <Tab.Screen name="Overview" component={OverviewScreen} />
-          <Tab.Screen name="Positions" component={PositionsScreen} />
-          <Tab.Screen name="Performance" component={PerformanceScreen} />
+        <Tab.Navigator
+          screenOptions={{
+            headerShown: false,
+            tabBarLabelStyle: { fontSize: 10, fontWeight: '700' },
+          }}
+        >
+          {/* Names align with web app header: Cockpit, Paper Trade, … */}
+          <Tab.Screen name="Cockpit" component={OverviewScreen} options={{ title: 'Cockpit' }} />
+          <Tab.Screen
+            name="Paper"
+            component={PositionsScreen}
+            options={{ title: 'Paper Trade', tabBarLabel: 'Paper' }}
+          />
+          <Tab.Screen name="Stats" component={PerformanceScreen} options={{ title: 'Stats' }} />
           <Tab.Screen name="Market" component={MarketScreen} />
           <Tab.Screen name="Chart" component={ChartScreen} />
-          <Tab.Screen name="Engine" component={EngineScreen} />
+          <Tab.Screen name="Engine" component={EngineScreen} options={{ title: 'Engine' }} />
         </Tab.Navigator>
       </View>
     </View>

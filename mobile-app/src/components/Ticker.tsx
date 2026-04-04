@@ -1,21 +1,23 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { LayoutChangeEvent, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useThemeTokens } from '../theme/useThemeTokens';
 
 type TickerItem = { label: string; value?: string | number; tone?: 'up' | 'down' | 'neutral' };
 
+/** px per frame at ~60fps */
+const SCROLL_SPEED = 0.65;
+
 export function Ticker({ items }: { items: TickerItem[] }) {
   const { colors, neon } = useThemeTokens();
   const scrollRef = useRef<ScrollView>(null);
   const offsetRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
   const [viewportW, setViewportW] = useState(0);
   const [stripW, setStripW] = useState(0);
-  const [scrollLoopW, setScrollLoopW] = useState(0);
-  const rafRef = useRef<number | null>(null);
+  const [dupContentW, setDupContentW] = useState(0);
 
-  const shouldScroll = items.length > 0 && stripW > 0 && viewportW > 0 && stripW > viewportW + 2;
-  /** Half of duplicated scroll content — wait for onContentSizeChange so the loop length is exact. */
-  const loopW = shouldScroll ? scrollLoopW : stripW;
+  const loopW = dupContentW > 0 ? dupContentW / 2 : stripW;
+  const overflow = stripW > 0 && viewportW > 0 && stripW > viewportW + 2;
 
   const onViewportLayout = useCallback((e: LayoutChangeEvent) => {
     setViewportW(e.nativeEvent.layout.width);
@@ -26,40 +28,43 @@ export function Ticker({ items }: { items: TickerItem[] }) {
     setStripW((prev) => (Math.abs(w - prev) > 1 ? w : prev));
   }, []);
 
-  const onScrollContentSizeChange = useCallback((w: number) => {
-    setScrollLoopW((prev) => {
-      const half = w / 2;
-      return Math.abs(half - prev) > 1 ? half : prev;
-    });
+  const onDupContentSizeChange = useCallback((w: number) => {
+    setDupContentW((prev) => (Math.abs(w - prev) > 2 ? w : prev));
   }, []);
 
   useEffect(() => {
     offsetRef.current = 0;
-    setScrollLoopW(0);
+    setDupContentW(0);
     scrollRef.current?.scrollTo({ x: 0, animated: false });
   }, [items]);
 
-  useEffect(() => {
-    if (!shouldScroll || loopW <= 0) return;
+  const tick = useCallback(() => {
+    if (!overflow || loopW <= 0) return;
+    offsetRef.current += SCROLL_SPEED;
+    if (offsetRef.current >= loopW) offsetRef.current -= loopW;
+    scrollRef.current?.scrollTo({ x: offsetRef.current, animated: false });
+  }, [overflow, loopW]);
 
-    const pxPerSec = 28;
-    let last = Date.now();
+  useLayoutEffect(() => {
+    if (!overflow || loopW <= 0) {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      return;
+    }
 
-    const tick = () => {
-      const now = Date.now();
-      const dt = (now - last) / 1000;
-      last = now;
-      offsetRef.current += pxPerSec * dt;
-      if (offsetRef.current >= loopW) offsetRef.current -= loopW;
-      scrollRef.current?.scrollTo({ x: offsetRef.current, animated: false });
-      rafRef.current = requestAnimationFrame(tick);
+    const loop = () => {
+      tick();
+      rafRef.current = requestAnimationFrame(loop);
     };
-
-    rafRef.current = requestAnimationFrame(tick);
+    offsetRef.current = 0;
+    scrollRef.current?.scrollTo({ x: 0, animated: false });
+    rafRef.current = requestAnimationFrame(loop);
     return () => {
       if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
     };
-  }, [shouldScroll, loopW, items]);
+  }, [overflow, loopW, tick, items]);
 
   const renderItems = (keyPrefix: string) =>
     items.map((it, idx) => {
@@ -75,39 +80,82 @@ export function Ticker({ items }: { items: TickerItem[] }) {
   if (items.length === 0) return null;
 
   return (
-    <View
-      style={[styles.container, { borderColor: 'rgba(255,255,255,0.06)', backgroundColor: 'rgba(255,255,255,0.02)' }]}
-      onLayout={onViewportLayout}
-    >
-      {shouldScroll ? (
-        <ScrollView
-          ref={scrollRef}
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          scrollEnabled={false}
-          nestedScrollEnabled={false}
-          bounces={false}
-          overScrollMode="never"
-          keyboardShouldPersistTaps="handled"
-          onContentSizeChange={(w) => onScrollContentSizeChange(w)}
-          contentContainerStyle={styles.scrollInner}
-        >
-          {renderItems('a')}
-          {renderItems('b')}
-        </ScrollView>
-      ) : (
-        <View style={styles.strip} onLayout={onStripLayout}>
-          {renderItems('s')}
+    <View style={styles.wrapper} onLayout={onViewportLayout}>
+      {/* Width measure — wrapper has NO overflow:hidden (would clip & break layout) */}
+      <View style={styles.measureLayer} pointerEvents="none" collapsable={false}>
+        <View style={styles.loopMeasure} onLayout={onStripLayout}>
+          {renderItems('m')}
         </View>
+      </View>
+
+      {overflow ? (
+        <View style={styles.clip}>
+          <ScrollView
+            ref={scrollRef}
+            style={styles.scrollView}
+            horizontal
+            scrollEnabled={false}
+            showsHorizontalScrollIndicator={false}
+            nestedScrollEnabled={false}
+            keyboardShouldPersistTaps="handled"
+            bounces={false}
+            overScrollMode="never"
+            onContentSizeChange={(w) => onDupContentSizeChange(w)}
+            contentContainerStyle={styles.scrollContent}
+          >
+            {renderItems('a')}
+            {renderItems('b')}
+          </ScrollView>
+        </View>
+      ) : (
+        <View style={styles.staticStrip}>{renderItems('s')}</View>
       )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { borderBottomWidth: 1, paddingVertical: 6, overflow: 'hidden' },
-  strip: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap', paddingHorizontal: 12 },
-  scrollInner: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap', paddingHorizontal: 12 },
+  wrapper: {
+    width: '100%',
+    borderBottomWidth: 1,
+    borderColor: 'rgba(255,255,255,0.06)',
+    backgroundColor: 'rgba(255,255,255,0.02)',
+    paddingVertical: 6,
+  },
+  measureLayer: {
+    position: 'absolute',
+    opacity: 0,
+    left: 0,
+    top: 6,
+    zIndex: -1,
+    maxHeight: 48,
+  },
+  loopMeasure: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    alignSelf: 'flex-start',
+    paddingHorizontal: 12,
+  },
+  clip: {
+    overflow: 'hidden',
+    width: '100%',
+    zIndex: 1,
+  },
+  scrollView: { width: '100%' },
+  scrollContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    paddingHorizontal: 12,
+  },
+  staticStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    paddingHorizontal: 12,
+    alignSelf: 'flex-start',
+  },
   item: { flexDirection: 'row', alignItems: 'center', marginRight: 18, gap: 6 as any, flexShrink: 0 },
   label: { fontSize: 12, fontWeight: '700' },
   value: { fontSize: 12, fontWeight: '800' },

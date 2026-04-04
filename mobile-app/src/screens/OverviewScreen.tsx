@@ -1,4 +1,4 @@
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigation } from '@react-navigation/native';
 import { mobileApi } from '../lib/api';
@@ -6,6 +6,7 @@ import { Screen } from '../components/Screen';
 import { formatUsd } from '@synaptic/shared';
 import { useThemeTokens } from '../theme/useThemeTokens';
 import { RegimeGauge } from '../components/Gauge';
+import { buildSortedCoinRows, coinConvictionPct, stripUsdt } from '../lib/brain-execution';
 import React from 'react';
 
 const EMPTY_COIN_STATES: Record<string, unknown> = {};
@@ -29,7 +30,11 @@ export function OverviewScreen() {
   const perBot: Record<string, any> | undefined = engine.data?.perBot;
   const recentTrades: any[] = engine.data?.tradebook?.trades || [];
   const multi = engine.data?.multi || {};
+  const pendingSignals: any[] = Array.isArray(multi?.pending_signals_detail) ? multi.pending_signals_detail : [];
+  const cockpitSignalQ: any[] = Array.isArray(cockpitQ.data?.signalQueue) ? cockpitQ.data.signalQueue : [];
   const [nextSecs, setNextSecs] = React.useState<number | null>(null);
+
+  const sortedCoinRows = React.useMemo(() => buildSortedCoinRows(coinStates as Record<string, any>), [coinStates]);
 
   function colorForDelta(delta: number) {
     const d = Math.max(-15, Math.min(15, Number.isFinite(delta) ? delta : 0));
@@ -56,7 +61,7 @@ export function OverviewScreen() {
   }, [engineSnap?.nextAnalysisTime]);
 
   return (
-    <Screen title="Overview" safeTop={false}>
+    <Screen title="Cockpit" safeTop={false}>
 
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading dashboard...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}
@@ -146,34 +151,113 @@ export function OverviewScreen() {
             )}
           </View>
 
-          {/* Athena Predictions */}
-          {athenaQueue.length ? (
+          {/* Signal Queue — same source as web: engine pending_signals_detail, else cockpit/athena */}
+          {(pendingSignals.length > 0 || cockpitSignalQ.length > 0 || athenaQueue.length > 0) && !engine.isLoading && !engine.error ? (
+            <View
+              style={[
+                styles.engineCard,
+                styles.signalQueueCard,
+                { backgroundColor: 'rgba(245,158,11,0.06)', borderColor: 'rgba(245,158,11,0.35)' },
+              ]}
+            >
+              <Text style={[styles.signalQueueTitle, { color: neon.amber }]}>Signal Queue — Athena-Approved, Awaiting Deploy</Text>
+              {pendingSignals.length > 0
+                ? pendingSignals.map((s: any, i: number) => {
+                    const side = String(s.side || '').toUpperCase();
+                    const long = side === 'LONG' || side === 'BUY';
+                    const ttlMin = Math.max(1, Math.ceil(Number(s.expires_in_sec || 0) / 60));
+                    const conv = Number(s.conviction ?? 0);
+                    return (
+                      <View key={`${s.symbol}-${i}`} style={[styles.sigQRow, { borderColor: 'rgba(245,158,11,0.28)' }]}>
+                        <Text style={[styles.sigQSym, { color: colors.text }]}>{stripUsdt(String(s.symbol || ''))}</Text>
+                        <Text style={[styles.sigQSide, { color: long ? neon.emerald : neon.danger }]}>{long ? 'LONG' : 'SHORT'}</Text>
+                        <Text style={[styles.sigQConv, { color: neon.amber }]}>{Number.isFinite(conv) ? `${Math.round(conv)}%` : '—'}</Text>
+                        <Text style={[styles.sigQTtl, { color: colors.textSecondary }]}>TTL {ttlMin}m</Text>
+                      </View>
+                    );
+                  })
+                : cockpitSignalQ.length > 0
+                  ? cockpitSignalQ.slice(0, 12).map((q: any, i: number) => {
+                      const side = String(q.side || '').toUpperCase();
+                      const long = side === 'LONG' || side === 'BUY';
+                      const conv = q.confidence != null ? Number(q.confidence) : null;
+                      const ttl = q.ttl != null ? `${q.ttl}` : '';
+                      return (
+                        <View key={`cq-${i}`} style={[styles.sigQRow, { borderColor: 'rgba(245,158,11,0.28)' }]}>
+                          <Text style={[styles.sigQSym, { color: colors.text }]}>{stripUsdt(String(q.symbol || ''))}</Text>
+                          <Text style={[styles.sigQSide, { color: long ? neon.emerald : neon.danger }]}>{long ? 'LONG' : 'SHORT'}</Text>
+                          <Text style={[styles.sigQConv, { color: neon.amber }]}>
+                            {conv != null && Number.isFinite(conv) ? `${Math.round(conv)}%` : '—'}
+                          </Text>
+                          {ttl ? <Text style={[styles.sigQTtl, { color: colors.textSecondary }]}>TTL {ttl}</Text> : null}
+                        </View>
+                      );
+                    })
+                  : athenaQueue.slice(0, 12).map((q: any, i: number) => (
+                      <View key={`ath-${i}`} style={[styles.sigQRow, { borderColor: 'rgba(245,158,11,0.28)' }]}>
+                        <Text style={[styles.sigQSym, { color: colors.text }]}>{stripUsdt(String(q.symbol || ''))}</Text>
+                        <Text
+                          style={[
+                            styles.sigQSide,
+                            { color: String(q.side || '').toUpperCase() === 'LONG' ? neon.emerald : neon.danger },
+                          ]}
+                        >
+                          {String(q.side || '').toUpperCase() || '—'}
+                        </Text>
+                        <Text style={[styles.sigQConv, { color: neon.amber }]}>
+                          {q.conviction != null
+                            ? `${Math.round(Number(q.conviction) * 100)}%`
+                            : q.confidence != null
+                              ? `${Math.round(Number(q.confidence))}%`
+                              : '—'}
+                        </Text>
+                      </View>
+                    ))}
+            </View>
+          ) : null}
+
+          {/* Coin pipeline — matches web Brain Execution table */}
+          {sortedCoinRows.length > 0 && !engine.isLoading && !engine.error ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
-              <Text style={[styles.sectionTitle, { color: colors.text }]}>Athena Predictions</Text>
-              {/* Signal Queue — Athena-approved, awaiting deploy */}
-              <View style={[styles.queueBox, { borderColor: glassBorder, backgroundColor: 'rgba(255,255,255,0.02)' }]}>
-                <Text style={[styles.queueTitle, { color: colors.textSecondary }]}>Signal Queue</Text>
-                {athenaQueue.slice(0, 6).map((q: any, i: number) => (
-                  <View key={i} style={styles.queueRow}>
-                    <Text style={[styles.queueSym, { color: colors.text }]}>{String(q.symbol || '').toUpperCase()}</Text>
-                    <Text style={[styles.queueSide, { color: (String(q.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>
-                      {String(q.side || '').toUpperCase() || '—'}
-                    </Text>
-                    <Text style={[styles.queueConv, { color: colors.textSecondary }]}>{q.conviction != null ? `${Math.round(Number(q.conviction) * 100)}%` : (q.confidence != null ? `${Math.round(Number(q.confidence))}%` : '')}</Text>
-                  </View>
-                ))}
-              </View>
-              {athenaQueue.map((d: any, i: number) => (
-                <View key={i} style={styles.predRow}>
-                  <Text style={[styles.predSymbol, { color: colors.text }]}>{String(d.symbol || '').toUpperCase()}</Text>
-                  <Text style={[styles.predSide, { color: (String(d.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>
-                    {String(d.side || '').toUpperCase() || '—'}
-                  </Text>
-                  <Text style={[styles.predMeta, { color: colors.textSecondary }]} numberOfLines={1}>
-                    {d.reason || d.model || ''}
-                  </Text>
-                </View>
-              ))}
+              <Text style={[styles.sectionTitle, { color: colors.text }]}>Brain Execution — Coin Pipeline</Text>
+              <Text style={[styles.pipelineHint, { color: colors.textSecondary }]}>
+                Segment → HMM → Athena → Deploy (same stages as web)
+              </Text>
+              <ScrollView style={styles.pipelineScroll} nestedScrollEnabled showsVerticalScrollIndicator>
+                {sortedCoinRows.map((c: any, idx: number) => {
+                  const regime = String(c.regime ?? '—');
+                  const conv = coinConvictionPct(c);
+                  const inSegPool = (c.stageNum ?? 0) >= 2;
+                  const seg = c.segment || '—';
+                  return (
+                    <View key={c.symbol || idx} style={[styles.pipelineRow, { borderColor: glassBorder }]}>
+                      <View style={styles.pipelineRowTop}>
+                        <Text style={[styles.pipelineIdx, { color: colors.textSecondary }]}>{idx + 1}</Text>
+                        <Text style={[styles.pipelineCoin, { color: colors.text }]}>{stripUsdt(c.symbol)}</Text>
+                        <Text style={[styles.pipelineSeg, { color: neon.cyan }]} numberOfLines={1}>
+                          {seg}
+                        </Text>
+                        <View style={[styles.stageBadge, { backgroundColor: `${c.color}22`, borderColor: `${c.color}44` }]}>
+                          <Text style={[styles.stageBadgeText, { color: c.color }]} numberOfLines={1}>
+                            {c.stage}
+                          </Text>
+                        </View>
+                      </View>
+                      <Text style={[styles.pipelineRegime, { color: colors.textSecondary }]} numberOfLines={3}>
+                        {inSegPool ? regime : '—'}
+                      </Text>
+                      <View style={styles.pipelineRowMid}>
+                        <Text style={[styles.pipelineConv, { color: inSegPool && conv > 0 ? neon.emerald : colors.textSecondary }]}>
+                          {inSegPool && conv > 0 ? `${Math.round(conv)}%` : '—'}
+                        </Text>
+                      </View>
+                      <Text style={[styles.pipelineReason, { color: colors.textSecondary }]} numberOfLines={3}>
+                        {c.reason}
+                      </Text>
+                    </View>
+                  );
+                })}
+              </ScrollView>
             </View>
           ) : null}
 
@@ -297,8 +381,8 @@ export function OverviewScreen() {
           <View style={[styles.quickActions, { backgroundColor: glassBg, borderColor: glassBorder }]}>
             <Text style={[styles.sectionTitle, { color: colors.text }]}>Quick Actions</Text>
             <View style={styles.actionGrid}>
-              <ActionButton label="Positions" onPress={() => nav.navigate('Positions')} textColor={colors.text} border={glassBorder} />
-              <ActionButton label="Performance" onPress={() => nav.navigate('Performance')} textColor={colors.text} border={glassBorder} />
+              <ActionButton label="Paper Trade" onPress={() => nav.navigate('Paper')} textColor={colors.text} border={glassBorder} />
+              <ActionButton label="Stats" onPress={() => nav.navigate('Stats')} textColor={colors.text} border={glassBorder} />
               <ActionButton label="Market" onPress={() => nav.navigate('Market')} textColor={colors.text} border={glassBorder} />
               <ActionButton label="Chart" onPress={() => nav.navigate('Chart')} textColor={colors.text} border={glassBorder} />
             </View>
@@ -424,6 +508,45 @@ const styles = StyleSheet.create({
   queueSym: { fontSize: 12, fontWeight: '800', width: 70 },
   queueSide: { fontSize: 12, fontWeight: '800', width: 54, textAlign: 'right' },
   queueConv: { fontSize: 11, fontWeight: '700', flex: 1, textAlign: 'right' },
+
+  signalQueueCard: { gap: 10 },
+  signalQueueTitle: { fontSize: 11, fontWeight: '800', letterSpacing: 0.8, textTransform: 'uppercase', marginBottom: 4 },
+  sigQRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 8 as any,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: 'rgba(245,158,11,0.08)',
+  },
+  sigQSym: { fontSize: 14, fontWeight: '800', minWidth: 56 },
+  sigQSide: { fontSize: 11, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, overflow: 'hidden' },
+  sigQConv: { fontSize: 12, fontWeight: '800' },
+  sigQTtl: { fontSize: 10, fontWeight: '600', marginLeft: 'auto' },
+
+  pipelineHint: { fontSize: 11, marginBottom: 8, lineHeight: 16 },
+  pipelineScroll: { maxHeight: 440 },
+  pipelineRow: {
+    borderWidth: 1,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+    gap: 4,
+  },
+  pipelineRowTop: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 6 as any },
+  pipelineIdx: { fontSize: 10, fontWeight: '700', width: 22 },
+  pipelineCoin: { fontSize: 15, fontWeight: '800', minWidth: 48 },
+  pipelineSeg: { fontSize: 11, fontWeight: '700', flex: 1, minWidth: 52 },
+  stageBadge: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 8, paddingVertical: 3, maxWidth: 120 },
+  stageBadgeText: { fontSize: 10, fontWeight: '800', textAlign: 'center' },
+  pipelineRegime: { fontSize: 11, lineHeight: 15 },
+  pipelineRowMid: { flexDirection: 'row', alignItems: 'center' },
+  pipelineConv: { fontSize: 14, fontWeight: '800' },
+  pipelineReason: { fontSize: 11, lineHeight: 15 },
+
   quickActions: { borderWidth: 1, borderRadius: 14, padding: 14 },
   actionGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 as any, marginTop: 8 },
   actionBtn: {

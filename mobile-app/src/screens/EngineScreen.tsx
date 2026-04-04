@@ -17,7 +17,7 @@ export function EngineScreen() {
     ['ok', 'active'].includes(String(data?.status || '').toLowerCase());
 
   return (
-    <Screen title="Engine Status" safeTop={false}>
+    <Screen title="Engine" safeTop={false}>
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading engine state...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}
       {data ? (

@@ -229,6 +229,7 @@ export function ChartScreen() {
 
   return (
     <View style={[styles.container, { backgroundColor: colors.background }]}>
+      <Text style={[styles.screenTitle, { color: colors.text }]}>Chart</Text>
       <View style={styles.header}>
         <Text style={[styles.title, { color: colors.text }]}>
           {toUsdtSymbol(selectedSymbol).replace('USDT', '')}/USDT
@@ -345,6 +346,7 @@ export function ChartScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1 },
+  screenTitle: { fontSize: 22, fontWeight: '700', paddingHorizontal: 16, paddingTop: 8, marginBottom: 4 },
   header: { padding: 16, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)' },
   title: { color: 'white', fontSize: 20, fontWeight: '800', marginBottom: 8 },
   statsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },

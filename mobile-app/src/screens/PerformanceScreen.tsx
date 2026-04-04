@@ -14,7 +14,7 @@ export function PerformanceScreen() {
   const pnl = Number(summary?.allTimePnl || 0);
 
   return (
-    <Screen title="Performance" safeTop={false}>
+    <Screen title="Stats" safeTop={false}>
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading performance...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}
       {summary ? (

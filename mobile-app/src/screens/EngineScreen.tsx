@@ -11,7 +11,10 @@ export function EngineScreen() {
   const clear = useAuthStore((s) => s.clear);
   const { data, isLoading, error } = useQuery({ queryKey: ['engine-status'], queryFn: mobileApi.engineStatus, refetchInterval: 15000 });
   const { colors, glassBg, glassBorder, neon } = useThemeTokens();
-  const online = String(data?.status || '').toLowerCase() === 'running' || String(data?.status || '').toLowerCase() === 'active';
+  const engineHealth = data?.engine as { status?: string } | undefined;
+  const online =
+    String(engineHealth?.status || '').toLowerCase() === 'running' ||
+    ['ok', 'active'].includes(String(data?.status || '').toLowerCase());
 
   return (
     <Screen title="Engine Status">

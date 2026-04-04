@@ -22,6 +22,7 @@ export function OverviewScreen() {
   const wallet = data?.wallet;
   const engineSnap = engine.data?.snapshot;
   const athena = engine.data?.athena;
+  const athenaQueue = athena?.athenaRecentDecisions ?? athena?.recent_decisions ?? [];
   const coinStates = engine.data?.multi?.coin_states || {};
   const segQ = useQuery({ queryKey: ['segments'], queryFn: mobileApi.marketSegments, refetchInterval: 30000 });
   const perBot: Record<string, any> | undefined = engine.data?.perBot;
@@ -126,7 +127,7 @@ export function OverviewScreen() {
                   </View>
                   <View style={[styles.besCard, { borderColor: glassBorder, backgroundColor: glassBg }]}>
                     <Text style={[styles.besLabel, { color: colors.textSecondary }]}>QUEUED</Text>
-                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.queued ?? Number(athena?.athenaRecentDecisions?.length ?? 0)}</Text>
+                    <Text style={[styles.besValue, { color: colors.text }]}>{cockpitQ.data?.queued ?? athenaQueue.length}</Text>
                   </View>
                 </View>
                 <Row label="Cycle" value={String(engineSnap?.cycle ?? '—')} color={colors.text} />
@@ -153,13 +154,13 @@ export function OverviewScreen() {
           </View>
 
           {/* Athena Predictions */}
-          {athena?.athenaRecentDecisions?.length ? (
+          {athenaQueue.length ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
               <Text style={[styles.sectionTitle, { color: colors.text }]}>Athena Predictions</Text>
               {/* Signal Queue — Athena-approved, awaiting deploy */}
               <View style={[styles.queueBox, { borderColor: glassBorder, backgroundColor: 'rgba(255,255,255,0.02)' }]}>
                 <Text style={[styles.queueTitle, { color: colors.textSecondary }]}>Signal Queue</Text>
-                {athena.athenaRecentDecisions.slice(0, 6).map((q: any, i: number) => (
+                {athenaQueue.slice(0, 6).map((q: any, i: number) => (
                   <View key={i} style={styles.queueRow}>
                     <Text style={[styles.queueSym, { color: colors.text }]}>{String(q.symbol || '').toUpperCase()}</Text>
                     <Text style={[styles.queueSide, { color: (String(q.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>
@@ -169,7 +170,7 @@ export function OverviewScreen() {
                   </View>
                 ))}
               </View>
-              {athena.athenaRecentDecisions.map((d: any, i: number) => (
+              {athenaQueue.map((d: any, i: number) => (
                 <View key={i} style={styles.predRow}>
                   <Text style={[styles.predSymbol, { color: colors.text }]}>{String(d.symbol || '').toUpperCase()}</Text>
                   <Text style={[styles.predSide, { color: (String(d.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>

@@ -41,7 +41,16 @@ export async function GET() {
     const segRaw = Array.isArray(data?.heatmap?.segments) ? data.heatmap.segments : [];
     const segments = segRaw.map((s: any) => {
       const name = s?.name ?? s?.segment ?? 'SEG';
-      const num = Number(String(s?.roi_24h ?? s?.change_24h ?? s?.roi ?? s?.delta ?? 0).toString().replace('%', ''));
+      // Engine `segment_heatmap.json` uses vw_4h / blended_score (see coin_scanner.py), not roi_24h.
+      const raw =
+        s?.roi_24h ??
+        s?.change_24h ??
+        s?.roi ??
+        s?.delta ??
+        s?.vw_4h ??
+        s?.blended_score ??
+        0;
+      const num = Number(String(raw).replace('%', ''));
       return { name, value: Number.isFinite(num) ? num : 0 };
     });
 

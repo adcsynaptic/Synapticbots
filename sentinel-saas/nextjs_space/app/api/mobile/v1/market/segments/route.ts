@@ -15,8 +15,15 @@ export async function GET() {
     const raw = Array.isArray(data?.heatmap?.segments) ? data.heatmap.segments : [];
     const segments = raw.map((s: any) => {
       const name = s?.name ?? s?.segment ?? 'SEG';
-      const cand = s?.roi_24h ?? s?.change_24h ?? s?.roi ?? s?.delta ?? 0;
-      const num = Number(String(cand).toString().replace('%', ''));
+      const cand =
+        s?.roi_24h ??
+        s?.change_24h ??
+        s?.roi ??
+        s?.delta ??
+        s?.vw_4h ??
+        s?.blended_score ??
+        0;
+      const num = Number(String(cand).replace('%', ''));
       const value = Number.isFinite(num) ? num : 0;
       return { name, value };
     });

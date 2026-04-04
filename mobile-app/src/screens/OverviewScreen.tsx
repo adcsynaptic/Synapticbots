@@ -9,6 +9,8 @@ import { Ticker } from '../components/Ticker';
 import { RegimeGauge } from '../components/Gauge';
 import React from 'react';
 
+const EMPTY_COIN_STATES: Record<string, unknown> = {};
+
 export function OverviewScreen() {
   const { colors, glassBg, glassBorder, neon } = useThemeTokens();
   const nav = useNavigation<any>();
@@ -23,7 +25,7 @@ export function OverviewScreen() {
   const engineSnap = engine.data?.snapshot;
   const athena = engine.data?.athena;
   const athenaQueue = athena?.athenaRecentDecisions ?? athena?.recent_decisions ?? [];
-  const coinStates = engine.data?.multi?.coin_states || {};
+  const coinStates = engine.data?.multi?.coin_states ?? EMPTY_COIN_STATES;
   const segQ = useQuery({ queryKey: ['segments'], queryFn: mobileApi.marketSegments, refetchInterval: 30000 });
   const perBot: Record<string, any> | undefined = engine.data?.perBot;
   const recentTrades: any[] = engine.data?.tradebook?.trades || [];
@@ -54,12 +56,14 @@ export function OverviewScreen() {
     return () => clearInterval(t);
   }, [engineSnap?.nextAnalysisTime]);
 
-  const tickerItems = Object.entries(coinStates)
-    .slice(0, 12)
-    .map(([sym, s]: any) => {
-      const pct = Number(s?.change_24h || s?.roi_24h || 0);
-      return { label: sym, value: `${pct >= 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(2)}%`, tone: pct >= 0 ? 'up' as const : 'down' as const };
-    });
+  const tickerItems = React.useMemo(() => {
+    return Object.entries(coinStates)
+      .slice(0, 12)
+      .map(([sym, s]: any) => {
+        const pct = Number(s?.change_24h || s?.roi_24h || 0);
+        return { label: sym, value: `${pct >= 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(2)}%`, tone: pct >= 0 ? ('up' as const) : ('down' as const) };
+      });
+  }, [coinStates]);
 
   return (
     <Screen title="Overview">

@@ -13,7 +13,7 @@ export function PositionsScreen() {
   const totalPnl = positions.reduce((sum: number, p: any) => sum + Number(p.pnl || 0), 0);
 
   return (
-    <Screen title="Positions">
+    <Screen title="Positions" safeTop={false}>
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading open positions...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}
       <View style={[styles.summary, { backgroundColor: glassBg, borderColor: glassBorder }]}>

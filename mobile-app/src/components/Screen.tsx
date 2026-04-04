@@ -1,11 +1,19 @@
 import React, { PropsWithChildren } from 'react';
-import { Platform, SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useThemeTokens } from '../theme/useThemeTokens';
 
-export function Screen({ title, children }: PropsWithChildren<{ title: string }>) {
+export function Screen({
+  title,
+  children,
+  safeTop = true,
+}: PropsWithChildren<{ title: string; safeTop?: boolean }>) {
   const { colors, neon } = useThemeTokens();
   return (
-    <SafeAreaView style={[styles.safe, { backgroundColor: colors.background }]}>
+    <SafeAreaView
+      style={[styles.safe, { backgroundColor: colors.background }]}
+      edges={safeTop ? ['top', 'left', 'right', 'bottom'] : ['left', 'right', 'bottom']}
+    >
       <ScrollView contentContainerStyle={styles.content}>
         <Text
           style={[

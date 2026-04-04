@@ -64,6 +64,43 @@ function shapeMobileEnginePayload(all: any) {
   };
 }
 
+/** When engine coin rows omit 24h % (MTF_INSUFFICIENT, vetoes, etc.), fill from public Binance ticker. */
+async function enrichCoinStates24h(coinStates: Record<string, any>): Promise<Record<string, any>> {
+  const keys = Object.keys(coinStates);
+  if (keys.length === 0) return coinStates;
+
+  const need = keys.filter((sym) => {
+    const s = coinStates[sym];
+    const v = Number(s?.change_24h ?? s?.price_change_24h ?? s?.priceChangePercent);
+    return !Number.isFinite(v);
+  });
+  if (need.length === 0) return coinStates;
+
+  const next = { ...coinStates };
+  const keyByUpper = new Map(Object.keys(next).map((k) => [k.toUpperCase(), k]));
+  try {
+    for (let i = 0; i < need.length; i += 100) {
+      const batch = need.slice(i, i + 100).map((s) => s.toUpperCase());
+      const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(JSON.stringify(batch))}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000), cache: 'no-store' });
+      if (!res.ok) continue;
+      const rows = (await res.json()) as { symbol?: string; priceChangePercent?: string }[];
+      if (!Array.isArray(rows)) continue;
+      for (const row of rows) {
+        const u = row.symbol?.toUpperCase();
+        const stateKey = u ? keyByUpper.get(u) : undefined;
+        if (!stateKey) continue;
+        const pct = parseFloat(String(row.priceChangePercent ?? ''));
+        if (!Number.isFinite(pct)) continue;
+        next[stateKey] = { ...next[stateKey], price_change_24h: pct, change_24h: pct };
+      }
+    }
+    return next;
+  } catch {
+    return coinStates;
+  }
+}
+
 export async function GET() {
   const mobileUser = await requireMobileUser();
   if (!mobileUser) return mobileError('UNAUTHORIZED', 'Missing or invalid token', 401);
@@ -94,7 +131,12 @@ export async function GET() {
       });
     }
 
-    const shaped = shapeMobileEnginePayload(all);
+    let shaped = shapeMobileEnginePayload(all);
+    const enriched = await enrichCoinStates24h(shaped.multi?.coin_states || {});
+    shaped = {
+      ...shaped,
+      multi: { ...shaped.multi, coin_states: enriched },
+    };
     const multi = shaped.multi;
     const coinStates = multi?.coin_states || {};
     const heatmap = shaped.heatmap;

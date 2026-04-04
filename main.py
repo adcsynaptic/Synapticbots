@@ -1963,6 +1963,13 @@ class RegimeMasterBot:
 
 
             # Update coin state for dashboard
+            _pc24 = 0.0
+            try:
+                client = _get_binance_client()
+                _t = client.get_ticker(symbol=symbol)
+                _pc24 = round(float(_t.get("priceChangePercent", 0)), 4)
+            except Exception:
+                pass
             self._coin_states[symbol] = {
                 "symbol": symbol,
                 "regime": regime_name,
@@ -1975,7 +1982,9 @@ class RegimeMasterBot:
                 "regime_summary": regime_summary,
                 "athena": athena_action,
                 "segment": get_segment_for_coin(symbol),
-                "context": {"trend_alignment": current_trend}
+                "context": {"trend_alignment": current_trend},
+                "price_change_24h": _pc24,
+                "change_24h": _pc24,
             }
 
             return {
@@ -2027,10 +2036,12 @@ class RegimeMasterBot:
             pass
         # Fetch real Binance 24h volume for this coin
         _volume_24h = 0.0
+        _price_change_24h = 0.0
         try:
             client = _get_binance_client()
             ticker = client.get_ticker(symbol=symbol)
             _volume_24h = round(float(ticker.get("quoteVolume", 0)), 2)
+            _price_change_24h = round(float(ticker.get("priceChangePercent", 0)), 4)
         except Exception:
             # Fallback: compute from 1h candles
             try:
@@ -2051,6 +2062,9 @@ class RegimeMasterBot:
             "macro_regime": macro_regime_name,
             "features":     _features,
             "volume_24h":   _volume_24h,
+            # Binance 24h ticker % — mobile/web tickers expect this (alias: change_24h / roi_24h)
+            "price_change_24h": _price_change_24h,
+            "change_24h":       _price_change_24h,
             "segment":      get_segment_for_coin(symbol),   # ← was missing: shortlist card shows '—' without this
         }
 

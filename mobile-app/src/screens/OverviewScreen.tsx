@@ -5,7 +5,6 @@ import { mobileApi } from '../lib/api';
 import { Screen } from '../components/Screen';
 import { formatUsd } from '@synaptic/shared';
 import { useThemeTokens } from '../theme/useThemeTokens';
-import { Ticker } from '../components/Ticker';
 import { RegimeGauge } from '../components/Gauge';
 import React from 'react';
 
@@ -56,18 +55,8 @@ export function OverviewScreen() {
     return () => clearInterval(t);
   }, [engineSnap?.nextAnalysisTime]);
 
-  const tickerItems = React.useMemo(() => {
-    return Object.entries(coinStates)
-      .slice(0, 12)
-      .map(([sym, s]: any) => {
-        const pct = Number(s?.change_24h || s?.roi_24h || 0);
-        return { label: sym, value: `${pct >= 0 ? '▲' : '▼'} ${Math.abs(pct).toFixed(2)}%`, tone: pct >= 0 ? ('up' as const) : ('down' as const) };
-      });
-  }, [coinStates]);
-
   return (
-    <Screen title="Overview">
-      <Ticker items={tickerItems} />
+    <Screen title="Overview" safeTop={false}>
 
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading dashboard...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}

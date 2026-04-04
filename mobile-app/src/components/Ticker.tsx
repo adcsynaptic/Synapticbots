@@ -1,46 +1,65 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Animated, LayoutChangeEvent, StyleSheet, Text, View } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { LayoutChangeEvent, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useThemeTokens } from '../theme/useThemeTokens';
 
 type TickerItem = { label: string; value?: string | number; tone?: 'up' | 'down' | 'neutral' };
 
 export function Ticker({ items }: { items: TickerItem[] }) {
   const { colors, neon } = useThemeTokens();
-  const translateX = useRef(new Animated.Value(0)).current;
-  const [chunkW, setChunkW] = useState(0);
-  const [trackW, setTrackW] = useState(0);
-  const loopRef = useRef<Animated.CompositeAnimation | null>(null);
+  const scrollRef = useRef<ScrollView>(null);
+  const offsetRef = useRef(0);
+  const [viewportW, setViewportW] = useState(0);
+  const [stripW, setStripW] = useState(0);
+  const [scrollLoopW, setScrollLoopW] = useState(0);
+  const rafRef = useRef<number | null>(null);
 
-  const shouldMarquee = items.length > 0 && chunkW > 0 && trackW > 0 && chunkW > trackW + 1;
+  const shouldScroll = items.length > 0 && stripW > 0 && viewportW > 0 && stripW > viewportW + 2;
+  /** Half of duplicated scroll content — wait for onContentSizeChange so the loop length is exact. */
+  const loopW = shouldScroll ? scrollLoopW : stripW;
+
+  const onViewportLayout = useCallback((e: LayoutChangeEvent) => {
+    setViewportW(e.nativeEvent.layout.width);
+  }, []);
+
+  const onStripLayout = useCallback((e: LayoutChangeEvent) => {
+    const w = e.nativeEvent.layout.width;
+    setStripW((prev) => (Math.abs(w - prev) > 1 ? w : prev));
+  }, []);
+
+  const onScrollContentSizeChange = useCallback((w: number) => {
+    setScrollLoopW((prev) => {
+      const half = w / 2;
+      return Math.abs(half - prev) > 1 ? half : prev;
+    });
+  }, []);
 
   useEffect(() => {
-    loopRef.current?.stop();
-    translateX.setValue(0);
-    if (!shouldMarquee) return;
+    offsetRef.current = 0;
+    setScrollLoopW(0);
+    scrollRef.current?.scrollTo({ x: 0, animated: false });
+  }, [items]);
 
-    const duration = Math.max(14000, Math.round(chunkW * 38));
-    const anim = Animated.loop(
-      Animated.timing(translateX, {
-        toValue: -chunkW,
-        duration,
-        useNativeDriver: true,
-      })
-    );
-    loopRef.current = anim;
-    anim.start();
-    return () => {
-      anim.stop();
+  useEffect(() => {
+    if (!shouldScroll || loopW <= 0) return;
+
+    const pxPerSec = 28;
+    let last = Date.now();
+
+    const tick = () => {
+      const now = Date.now();
+      const dt = (now - last) / 1000;
+      last = now;
+      offsetRef.current += pxPerSec * dt;
+      if (offsetRef.current >= loopW) offsetRef.current -= loopW;
+      scrollRef.current?.scrollTo({ x: offsetRef.current, animated: false });
+      rafRef.current = requestAnimationFrame(tick);
     };
-  }, [shouldMarquee, chunkW, translateX]);
 
-  const onTrackLayout = (e: LayoutChangeEvent) => {
-    setTrackW(e.nativeEvent.layout.width);
-  };
-
-  const onChunkLayout = (e: LayoutChangeEvent) => {
-    const w = e.nativeEvent.layout.width;
-    if (Math.abs(w - chunkW) > 0.5) setChunkW(w);
-  };
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
+    };
+  }, [shouldScroll, loopW, items]);
 
   const renderItems = (keyPrefix: string) =>
     items.map((it, idx) => {
@@ -56,16 +75,28 @@ export function Ticker({ items }: { items: TickerItem[] }) {
   if (items.length === 0) return null;
 
   return (
-    <View style={[styles.container, { borderColor: 'rgba(255,255,255,0.06)', backgroundColor: 'rgba(255,255,255,0.02)' }]} onLayout={onTrackLayout}>
-      {shouldMarquee ? (
-        <Animated.View style={[styles.track, { transform: [{ translateX }] }]}>
-          <View style={styles.chunk} onLayout={onChunkLayout}>
-            {renderItems('a')}
-          </View>
-          <View style={styles.chunk}>{renderItems('b')}</View>
-        </Animated.View>
+    <View
+      style={[styles.container, { borderColor: 'rgba(255,255,255,0.06)', backgroundColor: 'rgba(255,255,255,0.02)' }]}
+      onLayout={onViewportLayout}
+    >
+      {shouldScroll ? (
+        <ScrollView
+          ref={scrollRef}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          scrollEnabled={false}
+          nestedScrollEnabled={false}
+          bounces={false}
+          overScrollMode="never"
+          keyboardShouldPersistTaps="handled"
+          onContentSizeChange={(w) => onScrollContentSizeChange(w)}
+          contentContainerStyle={styles.scrollInner}
+        >
+          {renderItems('a')}
+          {renderItems('b')}
+        </ScrollView>
       ) : (
-        <View style={[styles.track, styles.staticRow]} onLayout={onChunkLayout}>
+        <View style={styles.strip} onLayout={onStripLayout}>
           {renderItems('s')}
         </View>
       )}
@@ -75,10 +106,9 @@ export function Ticker({ items }: { items: TickerItem[] }) {
 
 const styles = StyleSheet.create({
   container: { borderBottomWidth: 1, paddingVertical: 6, overflow: 'hidden' },
-  track: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap' },
-  staticRow: { paddingHorizontal: 12 },
-  chunk: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap', paddingHorizontal: 12 },
-  item: { flexDirection: 'row', alignItems: 'center', marginRight: 18, gap: 6 as any },
+  strip: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap', paddingHorizontal: 12 },
+  scrollInner: { flexDirection: 'row', alignItems: 'center', flexWrap: 'nowrap', paddingHorizontal: 12 },
+  item: { flexDirection: 'row', alignItems: 'center', marginRight: 18, gap: 6 as any, flexShrink: 0 },
   label: { fontSize: 12, fontWeight: '700' },
   value: { fontSize: 12, fontWeight: '800' },
 });

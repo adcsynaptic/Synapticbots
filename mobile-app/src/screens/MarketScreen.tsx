@@ -14,7 +14,7 @@ export function MarketScreen() {
   const sentimentLabel = fearGreed >= 60 ? 'Greed' : fearGreed >= 40 ? 'Neutral' : 'Fear';
 
   return (
-    <Screen title="Market">
+    <Screen title="Market" safeTop={false}>
       {isLoading ? <Text style={{ color: colors.textSecondary }}>Loading market feed...</Text> : null}
       {error ? <Text style={{ color: colors.danger }}>{String((error as Error).message)}</Text> : null}
       {data ? (

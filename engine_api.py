@@ -443,6 +443,20 @@ def api_health():
     global _engine_thread, _engine_start_time, _engine_bot
 
     is_alive = _engine_thread is not None and _engine_thread.is_alive()
+    # Self-heal: if thread is down but this process owns startup lock, restart thread.
+    if not is_alive:
+        try:
+            holder_pid = None
+            if os.path.exists(_STARTUP_LOCK_FILE):
+                with open(_STARTUP_LOCK_FILE, "r") as f:
+                    holder_raw = f.read().strip()
+                holder_pid = int(holder_raw) if holder_raw else None
+            if holder_pid == os.getpid():
+                logger.warning("🩹 Health self-heal: engine thread stopped on primary PID, restarting")
+                start_engine()
+                is_alive = _engine_thread is not None and _engine_thread.is_alive()
+        except Exception as e:
+            logger.warning("Health self-heal failed: %s", e)
     uptime_seconds = 0
     if _engine_start_time and is_alive:
         uptime_seconds = int(time.time() - _engine_start_time)
@@ -1534,6 +1548,12 @@ def _acquire_startup_lock() -> bool:
             holder_pid = int(holder_raw) if holder_raw else None
         except Exception:
             holder_pid = None
+
+        # Same-process re-import: current process already owns the lock.
+        if holder_pid and holder_pid == os.getpid():
+            _ENGINE_INITIALIZED = True
+            logger.info("🔐 Startup lock already owned by current PID %d", holder_pid)
+            return True
 
         # If no valid PID or process is gone, reclaim the stale lock.
         if not holder_pid or not _is_pid_alive(holder_pid):

@@ -1,4 +1,4 @@
-import { getEngineUrl } from '@/lib/engine-url';
+import { getAllEngineUrls, getEngineUrl } from '@/lib/engine-url';
 import { mobileError, mobileOk } from '@/lib/mobile-response';
 import { requireMobileUser } from '@/lib/mobile-request';
 
@@ -105,8 +105,13 @@ export async function GET() {
   const mobileUser = await requireMobileUser();
   if (!mobileUser) return mobileError('UNAUTHORIZED', 'Missing or invalid token', 401);
 
-  const url = getEngineUrl('live') || getEngineUrl('paper');
-  if (!url) {
+  const urls = getAllEngineUrls();
+  const urlCandidates = [
+    { mode: 'live' as const, url: urls.live },
+    { mode: 'paper' as const, url: urls.paper || getEngineUrl('paper') },
+  ].filter((x) => !!x.url);
+
+  if (urlCandidates.length === 0) {
     return mobileOk({ configured: false, status: 'not_configured' });
   }
 
@@ -114,19 +119,35 @@ export async function GET() {
     const secret = process.env.ENGINE_API_SECRET;
     const headers: Record<string, string> = secret ? { Authorization: `Bearer ${secret}` } : {};
 
-    const [healthRes, allRes] = await Promise.all([
-      fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000), cache: 'no-store', headers }),
-      fetch(`${url}/api/all`, { signal: AbortSignal.timeout(8000), cache: 'no-store', headers }),
-    ]);
+    const probes = await Promise.all(
+      urlCandidates.map(async ({ mode, url }) => {
+        const [healthRes, allRes] = await Promise.all([
+          fetch(`${url}/api/health`, { signal: AbortSignal.timeout(5000), cache: 'no-store', headers }),
+          fetch(`${url}/api/all`, { signal: AbortSignal.timeout(8000), cache: 'no-store', headers }),
+        ]);
+        const health = healthRes.ok ? await healthRes.json() : null;
+        const all = allRes.ok ? await allRes.json() : null;
+        const status = String(health?.status || '').toLowerCase();
+        const running = status === 'running' || status === 'ok' || status === 'active';
+        return { mode, url, healthRes, allRes, health, all, running };
+      })
+    );
 
-    const health = healthRes.ok ? await healthRes.json() : null;
-    const all = allRes.ok ? await allRes.json() : null;
+    // Prefer a running engine first; if both running, prefer live.
+    const chosen =
+      probes.find((p) => p.running && p.mode === 'live') ||
+      probes.find((p) => p.running) ||
+      probes.find((p) => p.mode === 'live') ||
+      probes[0];
+
+    const { healthRes, allRes, health, all, mode } = chosen;
 
     if (!all) {
       return mobileOk({
         configured: true,
         status: healthRes.ok ? String(health?.status || 'ok') : 'error',
         engine: health,
+        mode,
         checkedAt: new Date().toISOString(),
       });
     }
@@ -147,6 +168,7 @@ export async function GET() {
       // Prefer Flask health `status` (running/stopped) so EngineScreen can show live vs stopped.
       status: healthRes.ok ? String(health?.status || 'ok') : 'error',
       engine: health,
+      mode,
       ...shaped,
       snapshot: {
         cycle: multi?.cycle || 0,

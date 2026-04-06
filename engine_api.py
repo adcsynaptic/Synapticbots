@@ -1527,7 +1527,36 @@ def _acquire_startup_lock() -> bool:
         logger.info("🔒 Startup lock acquired (PID %d) — this is the primary engine instance", os.getpid())
         return True
     except FileExistsError:
-        logger.warning("⏭️  Startup lock already held — skipping duplicate engine start")
+        # Self-heal stale lock files after container restarts on persistent volumes.
+        try:
+            with open(_STARTUP_LOCK_FILE, "r") as f:
+                holder_raw = f.read().strip()
+            holder_pid = int(holder_raw) if holder_raw else None
+        except Exception:
+            holder_pid = None
+
+        # If no valid PID or process is gone, reclaim the stale lock.
+        if not holder_pid or not _is_pid_alive(holder_pid):
+            try:
+                os.remove(_STARTUP_LOCK_FILE)
+                logger.warning(
+                    "♻️  Removed stale startup lock (holder pid=%s). Retrying acquisition...",
+                    holder_pid if holder_pid else "unknown",
+                )
+                fd = os.open(_STARTUP_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                _ENGINE_INITIALIZED = True
+                logger.info("🔒 Startup lock re-acquired (PID %d) after stale cleanup", os.getpid())
+                return True
+            except Exception as e:
+                logger.warning("Could not reclaim stale startup lock: %s", e)
+                return False
+
+        logger.warning(
+            "⏭️  Startup lock held by active pid=%d — skipping duplicate engine start",
+            holder_pid,
+        )
         return False
     except Exception as e:
         logger.warning("Could not acquire startup lock (%s) — starting anyway", e)

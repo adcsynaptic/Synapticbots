@@ -1,5 +1,5 @@
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { useQuery } from '@tanstack/react-query';
+import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigation } from '@react-navigation/native';
 import { mobileApi } from '../lib/api';
 import { Screen } from '../components/Screen';
@@ -10,9 +10,11 @@ import { buildSortedCoinRows, coinConvictionPct, stripUsdt } from '../lib/brain-
 import React from 'react';
 
 const EMPTY_COIN_STATES: Record<string, unknown> = {};
+const SEGMENT_OPTIONS = ['L1', 'L2', 'AI', 'Meme', 'DeFi', 'RWA', 'Gaming', 'DePIN', 'Modular', 'Oracles'];
 
 export function OverviewScreen() {
   const { colors, glassBg, glassBorder, neon } = useThemeTokens();
+  const queryClient = useQueryClient();
   const nav = useNavigation<any>();
   const { data, isLoading, error } = useQuery({ queryKey: ['overview'], queryFn: mobileApi.overview, refetchInterval: 15000 });
   const engine = useQuery({ queryKey: ['engine-status'], queryFn: mobileApi.engineStatus, refetchInterval: 15000 });
@@ -33,6 +35,14 @@ export function OverviewScreen() {
   const pendingSignals: any[] = Array.isArray(multi?.pending_signals_detail) ? multi.pending_signals_detail : [];
   const cockpitSignalQ: any[] = Array.isArray(cockpitQ.data?.signalQueue) ? cockpitQ.data.signalQueue : [];
   const [nextSecs, setNextSecs] = React.useState<number | null>(null);
+  const [showCreateBotModal, setShowCreateBotModal] = React.useState(false);
+  const [creatingBot, setCreatingBot] = React.useState(false);
+  const [deployType, setDeployType] = React.useState<'adaptive' | 'segments'>('adaptive');
+  const [selectedSegments, setSelectedSegments] = React.useState<string[]>([]);
+  const [deployExchange, setDeployExchange] = React.useState<'binance' | 'coindcx'>('binance');
+  const [deployMode, setDeployMode] = React.useState<'paper' | 'live'>('paper');
+  const [deployMaxTrades, setDeployMaxTrades] = React.useState(10);
+  const [deployCapitalPerTrade, setDeployCapitalPerTrade] = React.useState(100);
 
   const sortedCoinRows = React.useMemo(() => buildSortedCoinRows(coinStates as Record<string, any>), [coinStates]);
 
@@ -59,6 +69,45 @@ export function OverviewScreen() {
     t = setInterval(update, 1000);
     return () => clearInterval(t);
   }, [engineSnap?.nextAnalysisTime]);
+
+  function toggleSegment(segment: string) {
+    setSelectedSegments((prev) => (prev.includes(segment) ? prev.filter((s) => s !== segment) : [...prev, segment]));
+  }
+
+  async function handleCreateBots() {
+    if (creatingBot) return;
+    if (deployType === 'segments' && selectedSegments.length === 0) {
+      Alert.alert('Select segments', 'Pick at least one segment or switch to Adaptive.');
+      return;
+    }
+
+    const deployments =
+      deployType === 'adaptive'
+        ? [{ name: 'ALL', segment: 'ALL', coinList: [] as string[] }]
+        : selectedSegments.map((segment) => ({ name: segment, segment, coinList: [] as string[] }));
+
+    setCreatingBot(true);
+    try {
+      const result = await mobileApi.createBots({
+        exchange: deployExchange,
+        mode: deployMode,
+        maxTrades: Math.max(1, deployMaxTrades),
+        capitalPerTrade: Math.max(10, deployCapitalPerTrade),
+        deployments,
+      });
+      setShowCreateBotModal(false);
+      Alert.alert('Bots created', `Successfully created ${result.count} bot${result.count === 1 ? '' : 's'}.`);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['overview'] }),
+        queryClient.invalidateQueries({ queryKey: ['engine-status'] }),
+        queryClient.invalidateQueries({ queryKey: ['cockpit'] }),
+      ]);
+    } catch (e) {
+      Alert.alert('Create bot failed', String((e as Error).message || 'Please try again.'));
+    } finally {
+      setCreatingBot(false);
+    }
+  }
 
   return (
     <Screen title="Cockpit" safeTop={false}>
@@ -385,10 +434,92 @@ export function OverviewScreen() {
               <ActionButton label="Stats" onPress={() => nav.navigate('Stats')} textColor={colors.text} border={glassBorder} />
               <ActionButton label="Market" onPress={() => nav.navigate('Market')} textColor={colors.text} border={glassBorder} />
               <ActionButton label="Chart" onPress={() => nav.navigate('Chart')} textColor={colors.text} border={glassBorder} />
+              <ActionButton label="Create Bot" onPress={() => setShowCreateBotModal(true)} textColor={colors.text} border={glassBorder} />
             </View>
           </View>
         </View>
       ) : null}
+      <Modal visible={showCreateBotModal} transparent animationType="fade" onRequestClose={() => setShowCreateBotModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>Create Bot</Text>
+
+            <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Type</Text>
+            <View style={styles.modalRow}>
+              <ChoiceButton label="Adaptive" active={deployType === 'adaptive'} onPress={() => setDeployType('adaptive')} />
+              <ChoiceButton label="By Segment" active={deployType === 'segments'} onPress={() => setDeployType('segments')} />
+            </View>
+
+            {deployType === 'segments' ? (
+              <View style={styles.segmentWrap}>
+                {SEGMENT_OPTIONS.map((segment) => (
+                  <Pressable
+                    key={segment}
+                    onPress={() => toggleSegment(segment)}
+                    style={[
+                      styles.segmentChip,
+                      {
+                        borderColor: selectedSegments.includes(segment) ? neon.cyan : glassBorder,
+                        backgroundColor: selectedSegments.includes(segment) ? 'rgba(6, 182, 212, 0.15)' : 'transparent',
+                      },
+                    ]}
+                  >
+                    <Text style={{ color: selectedSegments.includes(segment) ? neon.cyan : colors.text }}>{segment}</Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+
+            <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Exchange</Text>
+            <View style={styles.modalRow}>
+              <ChoiceButton label="Binance" active={deployExchange === 'binance'} onPress={() => setDeployExchange('binance')} />
+              <ChoiceButton label="CoinDCX" active={deployExchange === 'coindcx'} onPress={() => setDeployExchange('coindcx')} />
+            </View>
+
+            <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Mode</Text>
+            <View style={styles.modalRow}>
+              <ChoiceButton label="Paper" active={deployMode === 'paper'} onPress={() => setDeployMode('paper')} />
+              <ChoiceButton label="Live" active={deployMode === 'live'} onPress={() => setDeployMode('live')} />
+            </View>
+
+            <View style={styles.modalRow}>
+              <View style={styles.inputCol}>
+                <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Max Trades</Text>
+                <TextInput
+                  value={String(deployMaxTrades)}
+                  onChangeText={(v) => setDeployMaxTrades(Math.max(1, parseInt(v || '1', 10) || 1))}
+                  keyboardType="numeric"
+                  style={[styles.modalInput, { color: colors.text, borderColor: glassBorder }]}
+                />
+              </View>
+              <View style={styles.inputCol}>
+                <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Capital/Trade</Text>
+                <TextInput
+                  value={String(deployCapitalPerTrade)}
+                  onChangeText={(v) => setDeployCapitalPerTrade(Math.max(10, parseInt(v || '10', 10) || 10))}
+                  keyboardType="numeric"
+                  style={[styles.modalInput, { color: colors.text, borderColor: glassBorder }]}
+                />
+              </View>
+            </View>
+
+            <View style={styles.modalActions}>
+              <Pressable
+                onPress={() => setShowCreateBotModal(false)}
+                style={({ pressed }) => [styles.modalBtn, { borderColor: glassBorder, opacity: pressed ? 0.85 : 1 }]}
+              >
+                <Text style={{ color: colors.text }}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => void handleCreateBots()}
+                style={({ pressed }) => [styles.modalBtn, styles.modalBtnPrimary, { opacity: pressed || creatingBot ? 0.85 : 1 }]}
+              >
+                <Text style={{ color: '#02131F', fontWeight: '800' }}>{creatingBot ? 'Creating...' : 'Create'}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </Screen>
   );
 }
@@ -439,6 +570,14 @@ function ActionButton({
   return (
     <Pressable onPress={onPress} style={({ pressed }) => [styles.actionBtn, { borderColor: border, opacity: pressed ? 0.8 : 1 }]}>
       <Text style={[styles.actionText, { color: textColor }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
+function ChoiceButton({ label, active, onPress }: { label: string; active: boolean; onPress: () => void }) {
+  return (
+    <Pressable onPress={onPress} style={[styles.choiceBtn, active ? styles.choiceBtnActive : null]}>
+      <Text style={[styles.choiceText, active ? styles.choiceTextActive : null]}>{label}</Text>
     </Pressable>
   );
 }
@@ -559,4 +698,62 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.03)',
   },
   actionText: { fontSize: 13, fontWeight: '700' },
+
+  modalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    justifyContent: 'center',
+    padding: 18,
+  },
+  modalCard: {
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 14,
+    gap: 8,
+  },
+  modalTitle: { fontSize: 18, fontWeight: '800', marginBottom: 4 },
+  modalLabel: { fontSize: 12, fontWeight: '700', marginTop: 4 },
+  modalRow: { flexDirection: 'row', gap: 8 as any },
+  choiceBtn: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.12)',
+    borderRadius: 8,
+    paddingVertical: 9,
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.02)',
+  },
+  choiceBtnActive: {
+    borderColor: '#22D3EE',
+    backgroundColor: 'rgba(34,211,238,0.14)',
+  },
+  choiceText: { color: '#CBD5E1', fontWeight: '700', fontSize: 12 },
+  choiceTextActive: { color: '#22D3EE' },
+  segmentWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 as any, marginTop: 2, marginBottom: 4 },
+  segmentChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+  },
+  inputCol: { flex: 1, gap: 4 },
+  modalInput: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontWeight: '700',
+  },
+  modalActions: { flexDirection: 'row', gap: 8 as any, marginTop: 8 },
+  modalBtn: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  modalBtnPrimary: {
+    borderColor: '#22D3EE',
+    backgroundColor: '#22D3EE',
+  },
 });

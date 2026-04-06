@@ -107,4 +107,15 @@ export const mobileApi = {
       perBot: Record<string, any>;
       recentTrades: any[];
     }>('/api/mobile/v1/dashboard/cockpit'),
+  createBots: (payload: {
+    exchange: 'binance' | 'coindcx';
+    mode: 'paper' | 'live';
+    maxTrades: number;
+    capitalPerTrade: number;
+    deployments: Array<{ name?: string; segment: string; coinList?: string[] }>;
+  }) =>
+    request<{ count: number; bots: any[] }>('/api/mobile/v1/bots/create', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 };

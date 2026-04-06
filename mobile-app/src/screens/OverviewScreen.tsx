@@ -16,14 +16,18 @@ export function OverviewScreen() {
   const { colors, glassBg, glassBorder, neon } = useThemeTokens();
   const queryClient = useQueryClient();
   const nav = useNavigation<any>();
-  const { data, isLoading, error } = useQuery({ queryKey: ['overview'], queryFn: mobileApi.overview, refetchInterval: 15000 });
+  const overviewQ = useQuery({ queryKey: ['overview'], queryFn: mobileApi.overview, refetchInterval: 15000 });
   const engine = useQuery({ queryKey: ['engine-status'], queryFn: mobileApi.engineStatus, refetchInterval: 15000 });
   const positionsQ = useQuery({ queryKey: ['positions-mini'], queryFn: mobileApi.positions, refetchInterval: 15000 });
   const marketQ = useQuery({ queryKey: ['market-kpis'], queryFn: mobileApi.market, refetchInterval: 15000 });
   const cockpitQ = useQuery({ queryKey: ['cockpit'], queryFn: mobileApi.cockpit, refetchInterval: 15000 });
 
+  const data = overviewQ.data;
+  const isLoading = overviewQ.isLoading;
+  const error = overviewQ.error;
   const stats = data?.stats;
   const wallet = data?.wallet;
+  const myBots: any[] = Array.isArray(data?.bots) ? data.bots : [];
   const engineSnap = engine.data?.snapshot;
   const athena = engine.data?.athena;
   const athenaQueue = athena?.athenaRecentDecisions ?? athena?.recent_decisions ?? [];
@@ -43,6 +47,13 @@ export function OverviewScreen() {
   const [deployMode, setDeployMode] = React.useState<'paper' | 'live'>('paper');
   const [deployMaxTrades, setDeployMaxTrades] = React.useState(10);
   const [deployCapitalPerTrade, setDeployCapitalPerTrade] = React.useState(100);
+  const [busyBotId, setBusyBotId] = React.useState<string | null>(null);
+  const [showEditBotModal, setShowEditBotModal] = React.useState(false);
+  const [editBotId, setEditBotId] = React.useState<string | null>(null);
+  const [editMode, setEditMode] = React.useState<'paper' | 'live'>('paper');
+  const [editMaxTrades, setEditMaxTrades] = React.useState(10);
+  const [editCapitalPerTrade, setEditCapitalPerTrade] = React.useState(100);
+  const [savingEdit, setSavingEdit] = React.useState(false);
 
   const sortedCoinRows = React.useMemo(() => buildSortedCoinRows(coinStates as Record<string, any>), [coinStates]);
 
@@ -96,16 +107,107 @@ export function OverviewScreen() {
         deployments,
       });
       setShowCreateBotModal(false);
+      setSelectedSegments([]);
       Alert.alert('Bots created', `Successfully created ${result.count} bot${result.count === 1 ? '' : 's'}.`);
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['overview'] }),
         queryClient.invalidateQueries({ queryKey: ['engine-status'] }),
         queryClient.invalidateQueries({ queryKey: ['cockpit'] }),
+        overviewQ.refetch(),
+        engine.refetch(),
+        cockpitQ.refetch(),
       ]);
     } catch (e) {
       Alert.alert('Create bot failed', String((e as Error).message || 'Please try again.'));
     } finally {
       setCreatingBot(false);
+    }
+  }
+
+  async function refreshCockpitData() {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['overview'] }),
+      queryClient.invalidateQueries({ queryKey: ['engine-status'] }),
+      queryClient.invalidateQueries({ queryKey: ['cockpit'] }),
+      overviewQ.refetch(),
+      engine.refetch(),
+      cockpitQ.refetch(),
+    ]);
+  }
+
+  async function handleToggleBot(botId: string, nextActive: boolean) {
+    if (busyBotId) return;
+    setBusyBotId(botId);
+    try {
+      await mobileApi.toggleBot(botId, nextActive);
+      await refreshCockpitData();
+    } catch (e) {
+      Alert.alert('Bot action failed', String((e as Error).message || 'Please try again.'));
+    } finally {
+      setBusyBotId(null);
+    }
+  }
+
+  function handleDeleteBot(botId: string) {
+    Alert.alert('Delete bot', 'Delete this bot permanently?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          void (async () => {
+            if (busyBotId) return;
+            setBusyBotId(botId);
+            try {
+              await mobileApi.deleteBot(botId);
+              await refreshCockpitData();
+            } catch (e) {
+              Alert.alert('Delete failed', String((e as Error).message || 'Please try again.'));
+            } finally {
+              setBusyBotId(null);
+            }
+          })();
+        },
+      },
+    ]);
+  }
+
+  async function handleOpenEditBot(botId: string) {
+    if (busyBotId) return;
+    setBusyBotId(botId);
+    try {
+      const data = await mobileApi.botConfig(botId);
+      const cfg = data.config || {};
+      setEditBotId(botId);
+      setEditMode(String(cfg.mode || 'paper').toLowerCase().startsWith('live') ? 'live' : 'paper');
+      setEditMaxTrades(Math.max(1, Number(cfg.maxOpenTrades || 10)));
+      setEditCapitalPerTrade(Math.max(10, Number(cfg.capitalPerTrade || 100)));
+      setShowEditBotModal(true);
+    } catch (e) {
+      Alert.alert('Open edit failed', String((e as Error).message || 'Please try again.'));
+    } finally {
+      setBusyBotId(null);
+    }
+  }
+
+  async function handleSaveBotEdit() {
+    if (!editBotId || savingEdit) return;
+    setSavingEdit(true);
+    try {
+      await mobileApi.updateBotConfig({
+        botId: editBotId,
+        mode: editMode,
+        maxOpenTrades: Math.max(1, editMaxTrades),
+        capitalPerTrade: Math.max(10, editCapitalPerTrade),
+      });
+      setShowEditBotModal(false);
+      setEditBotId(null);
+      await refreshCockpitData();
+      Alert.alert('Updated', 'Bot settings updated.');
+    } catch (e) {
+      Alert.alert('Update failed', String((e as Error).message || 'Please try again.'));
+    } finally {
+      setSavingEdit(false);
     }
   }
 
@@ -352,6 +454,60 @@ export function OverviewScreen() {
             </View>
           ) : null}
 
+          <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
+            <Text style={[styles.sectionTitle, { color: colors.text }]}>My Bots</Text>
+            {myBots.length === 0 ? (
+              <Text style={{ color: colors.textSecondary }}>No bots created yet.</Text>
+            ) : (
+              myBots.slice(0, 8).map((b) => (
+                <View key={b.id} style={styles.botRowWrap}>
+                  <View style={styles.predRow}>
+                    <Text style={[styles.predSymbol, { color: colors.text }]} numberOfLines={1}>
+                      {String(b.name || '').toUpperCase()}
+                    </Text>
+                    <Text style={[styles.predSide, { color: b.isActive ? neon.emerald : colors.textSecondary }]}>
+                      {b.isActive ? 'ACTIVE' : 'STOPPED'}
+                    </Text>
+                    <Text style={[styles.predMeta, { color: colors.textSecondary }]} numberOfLines={1}>
+                      {String(b.segment || 'ALL')} · {String(b.mode || 'paper').toUpperCase()} · {String(b.exchange || '')}
+                    </Text>
+                  </View>
+                  <View style={styles.botActionRow}>
+                    <Pressable
+                      onPress={() => void handleToggleBot(b.id, !b.isActive)}
+                      style={({ pressed }) => [
+                        styles.botActionBtn,
+                        { borderColor: glassBorder, opacity: pressed || busyBotId === b.id ? 0.8 : 1 },
+                      ]}
+                    >
+                      <Text style={{ color: b.isActive ? neon.amber : neon.emerald, fontWeight: '700', fontSize: 11 }}>
+                        {b.isActive ? 'Stop' : 'Start'}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={() => void handleOpenEditBot(b.id)}
+                      style={({ pressed }) => [
+                        styles.botActionBtn,
+                        { borderColor: glassBorder, opacity: pressed || busyBotId === b.id ? 0.8 : 1 },
+                      ]}
+                    >
+                      <Text style={{ color: colors.text, fontWeight: '700', fontSize: 11 }}>Edit</Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={() => handleDeleteBot(b.id)}
+                      style={({ pressed }) => [
+                        styles.botActionBtn,
+                        { borderColor: 'rgba(239,68,68,0.4)', opacity: pressed || busyBotId === b.id ? 0.8 : 1 },
+                      ]}
+                    >
+                      <Text style={{ color: colors.danger, fontWeight: '700', fontSize: 11 }}>Delete</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              ))
+            )}
+          </View>
+
           {/* Segment Heatmap Grid */}
           {Array.isArray((cockpitQ.data?.segments || segQ.data?.segments)) && (cockpitQ.data?.segments || segQ.data?.segments)?.length ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
@@ -520,6 +676,52 @@ export function OverviewScreen() {
           </View>
         </View>
       </Modal>
+      <Modal visible={showEditBotModal} transparent animationType="fade" onRequestClose={() => setShowEditBotModal(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={[styles.modalCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
+            <Text style={[styles.modalTitle, { color: colors.text }]}>Edit Bot</Text>
+            <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Mode</Text>
+            <View style={styles.modalRow}>
+              <ChoiceButton label="Paper" active={editMode === 'paper'} onPress={() => setEditMode('paper')} />
+              <ChoiceButton label="Live" active={editMode === 'live'} onPress={() => setEditMode('live')} />
+            </View>
+            <View style={styles.modalRow}>
+              <View style={styles.inputCol}>
+                <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Max Trades</Text>
+                <TextInput
+                  value={String(editMaxTrades)}
+                  onChangeText={(v) => setEditMaxTrades(Math.max(1, parseInt(v || '1', 10) || 1))}
+                  keyboardType="numeric"
+                  style={[styles.modalInput, { color: colors.text, borderColor: glassBorder }]}
+                />
+              </View>
+              <View style={styles.inputCol}>
+                <Text style={[styles.modalLabel, { color: colors.textSecondary }]}>Capital/Trade</Text>
+                <TextInput
+                  value={String(editCapitalPerTrade)}
+                  onChangeText={(v) => setEditCapitalPerTrade(Math.max(10, parseInt(v || '10', 10) || 10))}
+                  keyboardType="numeric"
+                  style={[styles.modalInput, { color: colors.text, borderColor: glassBorder }]}
+                />
+              </View>
+            </View>
+            <View style={styles.modalActions}>
+              <Pressable
+                onPress={() => setShowEditBotModal(false)}
+                style={({ pressed }) => [styles.modalBtn, { borderColor: glassBorder, opacity: pressed ? 0.85 : 1 }]}
+              >
+                <Text style={{ color: colors.text }}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => void handleSaveBotEdit()}
+                style={({ pressed }) => [styles.modalBtn, styles.modalBtnPrimary, { opacity: pressed || savingEdit ? 0.85 : 1 }]}
+              >
+                <Text style={{ color: '#02131F', fontWeight: '800' }}>{savingEdit ? 'Saving...' : 'Save'}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </Screen>
   );
 }
@@ -621,6 +823,15 @@ const styles = StyleSheet.create({
   botTitle: { fontSize: 12, fontWeight: '800', marginBottom: 4 },
   botMeta: { fontSize: 11, fontWeight: '600', marginBottom: 4 },
   botPnl: { fontSize: 14, fontWeight: '800' },
+  botRowWrap: { gap: 8 },
+  botActionRow: { flexDirection: 'row', gap: 8 as any },
+  botActionBtn: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    backgroundColor: 'rgba(255,255,255,0.02)',
+  },
 
   // Heatmap
   heatGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 as any, marginTop: 6 },

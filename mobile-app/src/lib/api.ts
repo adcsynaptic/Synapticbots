@@ -118,4 +118,21 @@ export const mobileApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  toggleBot: (botId: string, isActive: boolean) =>
+    request<{ success: boolean; isActive: boolean }>('/api/mobile/v1/bots/toggle', {
+      method: 'POST',
+      body: JSON.stringify({ botId, isActive }),
+    }),
+  deleteBot: (botId: string) =>
+    request<{ success: boolean }>('/api/mobile/v1/bots/delete', {
+      method: 'POST',
+      body: JSON.stringify({ botId }),
+    }),
+  botConfig: (botId: string) =>
+    request<{ bot: any; config: any; state: any }>(`/api/mobile/v1/bots/config?botId=${encodeURIComponent(botId)}`),
+  updateBotConfig: (payload: { botId: string; mode?: 'paper' | 'live'; capitalPerTrade?: number; maxOpenTrades?: number }) =>
+    request<{ success: boolean; config: any }>('/api/mobile/v1/bots/config', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
 };

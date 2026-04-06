@@ -11,7 +11,17 @@ export async function GET() {
   const user = await prisma.user.findUnique({
     where: { id: mobileUser.id },
     include: {
-      bots: { select: { id: true, isActive: true } },
+      bots: {
+        include: {
+          config: {
+            select: {
+              mode: true,
+              segment: true,
+            },
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+      },
     },
   });
   if (!user) return mobileError('UNAUTHORIZED', 'User not found', 401);
@@ -37,6 +47,16 @@ export async function GET() {
       totalTrades: trades.length,
       totalPnl,
     },
+    bots: user.bots.map((b) => ({
+      id: b.id,
+      name: b.name,
+      exchange: b.exchange,
+      status: b.status,
+      isActive: b.isActive,
+      mode: b.config?.mode ?? 'paper',
+      segment: b.config?.segment ?? 'ALL',
+      createdAt: b.createdAt,
+    })),
     wallet: {
       binance: null,
       coindcx: null,

@@ -22,12 +22,19 @@ export async function POST(request: Request) {
       );
     }
 
-    const { name, exchange, mode, maxTrades, capitalPerTrade, deployments } = await request.json();
+    const { name, exchange, mode, maxTrades, capitalPerTrade, deployments = [] } = await request.json();
 
     // Determine basic validation
-    if (!exchange || !deployments || !Array.isArray(deployments) || deployments.length === 0) {
-      return NextResponse.json({ error: 'Missing required fields or empty deployments list.' }, { status: 400 });
+    if (!exchange) {
+      return NextResponse.json({ error: 'Missing required fields: exchange is required.' }, { status: 400 });
     }
+
+    // Use frontend deployments or fallback to single engine
+    const finalDeployments = deployments.length > 0 ? deployments : [{
+      name: name || 'Synaptic Engine',
+      segment: 'ALL',
+      coinList: []
+    }];
 
     // Check bot count limits for the user's tier
     const user = await prisma.user.findUnique({
@@ -37,11 +44,11 @@ export async function POST(request: Request) {
 
     const limits = TIER_LIMITS[subStatus.tier];
     const maxBots = limits.maxBots;
-    const incomingCount = deployments.length;
-
-    if (user && (user.bots.length + incomingCount) > maxBots) {
+    
+    // Hard check: Ensure not exceeding limits
+    if (user && (user.bots.length + finalDeployments.length) > maxBots) {
       return NextResponse.json(
-        { error: `Bot limit exceeded. You have ${user.bots.length}/${maxBots} bots. Cannot add ${incomingCount} more.` },
+        { error: `Bot limit reached. Max allowed is ${maxBots}.` },
         { status: 403 }
       );
     }
@@ -55,7 +62,7 @@ export async function POST(request: Request) {
 
     // Use Prisma transaction to create all requested bots safely
     const createdBots = await prisma.$transaction(
-      deployments.map((dep: any) => {
+      finalDeployments.map((dep: any) => {
         // Enforce the coin scans limit if a custom list is provided, otherwise default to top 5
         const defaultCoins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'];
         const _coins = dep.coinList && Array.isArray(dep.coinList) && dep.coinList.length > 0

@@ -9,7 +9,7 @@ import prisma from './prisma';
 
 export const TIER_LIMITS = {
     free: {
-        maxBots: 1,
+        maxBots: 3,
         maxCoinScans: 5,
         exchanges: 1,
         liveTrading: false,
@@ -21,7 +21,7 @@ export const TIER_LIMITS = {
         multiBotMgmt: false,
     },
     pro: {
-        maxBots: 3,
+        maxBots: 10,
         maxCoinScans: 15,
         exchanges: 1,
         liveTrading: true,
@@ -33,7 +33,7 @@ export const TIER_LIMITS = {
         multiBotMgmt: false,
     },
     ultra: {
-        maxBots: 999,
+        maxBots: 50,
         maxCoinScans: 50,
         exchanges: 2,
         liveTrading: true,
@@ -42,7 +42,7 @@ export const TIER_LIMITS = {
         trailingSl: true,
         killSwitch: true,
         apiAccess: true,
-        multiBotMgmt: true,
+        multiBotMgmt: false,
     },
 } as const;
 

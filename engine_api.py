@@ -63,7 +63,11 @@ def _clear_pid_lock():
     try:
         if os.path.exists(ENGINE_PID_FILE):
             os.remove(ENGINE_PID_FILE)
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
 
 
@@ -74,7 +78,11 @@ def _is_pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError):
         return False
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         return False
 
 
@@ -89,7 +97,11 @@ def _wait_for_old_engine_to_die(timeout: int = 45) -> bool:
     try:
         with open(ENGINE_PID_FILE) as f:
             old_pid = int(f.read().strip())
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         return True  # Unreadable lock → assume safe
 
     if old_pid == os.getpid():
@@ -121,8 +133,8 @@ def _wait_for_old_engine_to_die(timeout: int = 45) -> bool:
 logger = logging.getLogger("EngineAPI")
 
 # ─── Persistent crash log (survives process restarts) ─────────────────
-CRASH_LOG_FILE = "engine_crashes.json"
-BOOT_COUNT_FILE = "engine_boot_count.json"
+CRASH_LOG_FILE = os.path.join(config.DATA_DIR, "engine_crashes.json")  # I8 FIX: use DATA_DIR, not cwd
+BOOT_COUNT_FILE = os.path.join(config.DATA_DIR, "engine_boot_count.json")
 
 def _load_crash_log():
     """Load persistent crash history from disk."""
@@ -130,7 +142,11 @@ def _load_crash_log():
         if os.path.exists(CRASH_LOG_FILE):
             with open(CRASH_LOG_FILE, "r") as f:
                 return json.loads(f.read())
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
     return {"boots": 0, "total_crashes": 0, "crashes": []}
 
@@ -161,7 +177,11 @@ def _increment_boot_count():
         with open(CRASH_LOG_FILE, "w") as f:
             f.write(json.dumps(log, indent=2))
         return log["boots"]
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         return 0
 
 def _get_memory_mb():
@@ -173,14 +193,22 @@ def _get_memory_mb():
         if os.uname().sysname == "Darwin":
             return round(rusage.ru_maxrss / 1024 / 1024, 1)
         return round(rusage.ru_maxrss / 1024, 1)
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         try:
             # Fallback: read /proc/self/status on Linux
             with open("/proc/self/status") as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
                         return round(int(line.split()[1]) / 1024, 1)
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
     return 0
 
@@ -207,7 +235,11 @@ class _BufferHandler(logging.Handler):
             msg = f"[{ts}] {record.getMessage()}"
             with _log_lock:
                 _log_buffer.append(msg)
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
 # Install buffer handler on root logger so ALL engine output is captured
@@ -294,37 +326,56 @@ def _save_active_bots():
 def pull_active_bots_from_saas():
     """
     Pull active bots from SaaS DB via the Next.js internal API.
-    This is the primary source of truth — no push/registration required.
-    Engine mode (paper/live) is determined by PAPER_TRADE env var.
+    Fetches BOTH paper and live bots so the outer engine gate knows
+    which bot names (Pyxis, Axiom, Ratio) are registered at all.
+    Trade deployment itself is still mode-isolated by _find_bots().
     Returns True if bots were refreshed, False on failure.
     """
     saas_url = config.SAAS_API_URL
     if not saas_url:
         return False  # Not configured — rely on push registration fallback
 
-    mode = "paper" if config.PAPER_TRADE else "live"
-    url = f"{saas_url.rstrip('/')}/api/internal/active-bots?mode={mode}"
-    headers = {"X-Synaptic-Internal": "engine-pull"}
+    if saas_url and not saas_url.startswith("http"):
+        saas_url = f"https://{saas_url}"
 
-    try:
-        import urllib.request
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode())
-        bots = data.get("bots", [])
-        if not isinstance(bots, list):
-            return False
-        config.ENGINE_ACTIVE_BOTS = bots
-        if bots:
-            config.ENGINE_BOT_ID = bots[-1].get("bot_id", config.ENGINE_BOT_ID)
-        else:
-            logger.warning("⚠️  SaaS returned 0 active %s bots — deploy loop will be skipped this cycle", mode)
+    headers = {"X-Synaptic-Internal": "engine-pull"}
+    all_bots = []
+    seen_ids = set()
+
+    for mode in ("paper", "live"):
+        url = f"{saas_url.rstrip('/')}/api/internal/active-bots?mode={mode}"
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode())
+            bots = data.get("bots", [])
+            if isinstance(bots, list):
+                for b in bots:
+                    key = (b.get("bot_id"), b.get("mode", mode))
+                    if key not in seen_ids:
+                        seen_ids.add(key)
+                        all_bots.append(b)
+                logger.info("✅ Pulled %d %s bots from SaaS DB", len(bots), mode)
+            else:
+                logger.warning("⚠️  SaaS returned non-list for mode=%s", mode)
+        except Exception as e:
+            logger.warning("⚠️  SaaS %s bot pull failed (%s)", mode, e)
+
+    if all_bots:
+        config.ENGINE_ACTIVE_BOTS = all_bots
+        config.ENGINE_BOT_ID = all_bots[-1].get("bot_id", config.ENGINE_BOT_ID)
         _save_active_bots()
-        logger.info("✅ Pulled %d active %s bots from SaaS DB", len(bots), mode)
+        logger.info(
+            "✅ ENGINE_ACTIVE_BOTS populated: %d total bots (paper+live) | names: %s",
+            len(all_bots),
+            list({b.get('bot_name', '?') for b in all_bots}),
+        )
         return True
-    except Exception as e:
-        logger.warning("⚠️  SaaS bot pull failed (%s) — keeping existing %d bots", e, len(config.ENGINE_ACTIVE_BOTS))
+    else:
+        logger.warning("⚠️  SaaS returned 0 active bots (paper+live) — deploy loop will be skipped")
         return False
+
 
 # Startup: try SaaS pull first, fall back to disk cache
 if not pull_active_bots_from_saas():
@@ -378,11 +429,42 @@ def _auth_middleware():
 @app.route("/api/all", methods=["GET"])
 def api_all():
     """Return all engine state for the dashboard."""
-    multi = _read_json("multi_bot_state.json", {
-        "coin_states": {},
-        "last_analysis_time": None,
-    })
-    tradebook = _read_json("tradebook.json", {"trades": [], "summary": {}})
+    r = None
+    try:
+        import redis
+        r = redis.from_url(config.REDIS_URL, decode_responses=True)
+    except Exception:
+        pass
+        
+    # --- PHASE 2A: REDIS FETCH FOR MULTI_BOT_STATE ---
+    multi = None
+    if r:
+        try:
+            cached_multi = r.get("synaptic:multi_bot_state")
+            if cached_multi:
+                multi = json.loads(cached_multi)
+        except Exception:
+            pass
+            
+    if not multi:
+        multi = _read_json("multi_bot_state.json", {
+            "coin_states": {},
+            "last_analysis_time": None,
+        })
+        
+    # --- PHASE 2A: REDIS FETCH FOR TRADEBOOK ---
+    tradebook = None
+    if r:
+        try:
+            cached_tb = r.get("synaptic:tradebook")
+            if cached_tb:
+                tradebook = json.loads(cached_tb)
+        except Exception:
+            pass
+            
+    if not tradebook:
+        tradebook = _read_json("tradebook.json", {"trades": [], "summary": {}})
+        
     # ── Safeguard: auto-fix stale summary if trades array is empty ──
     tb_trades = tradebook.get("trades", [])
     tb_summary = tradebook.get("summary", {})
@@ -394,21 +476,20 @@ def api_all():
         tb._compute_summary(book)
         tb._save_book(book)
         tradebook = book
+        
     engine = _read_json("engine_state.json", {"status": "running"})
-    heatmap = _read_json("segment_heatmap.json", {"segments": []})
+    legacy = _read_json("legacy_portfolio.json", {})
 
     return jsonify({
         "multi": multi,
         "tradebook": tradebook,
         "engine": engine,
-        "heatmap": heatmap,
         # Athena LLM Reasoning Layer state (from live bot object, not disk)
         "athena": _engine_bot._athena.get_state() if _engine_bot and hasattr(_engine_bot, '_athena') and _engine_bot._athena else {"enabled": False},
         # List of bot IDs currently registered with the engine (cleared on restart).
         # Frontend uses this to detect de-registration and auto-re-push bots.
         "registered_bot_ids": [b["bot_id"] for b in config.ENGINE_ACTIVE_BOTS],
     })
-
 
 @app.route("/api/gemini-health", methods=["GET"])
 def api_gemini_health():
@@ -435,6 +516,39 @@ def api_gemini_health():
         return jsonify({"status": "error", "message": "google-generativeai not installed", "key_set": True})
     except Exception as e:
         return jsonify({"status": "error", "message": f"Key validation failed: {str(e)[:200]}", "key_set": True})
+
+
+@app.route("/api/exchange-positions", methods=["GET"])
+def api_exchange_positions():
+    """Securely proxy real-time position data natively from the active exchange."""
+    if config.PAPER_TRADE:
+        return jsonify({"positions": [], "mode": "paper", "message": "Cannot fetch exchange data in Paper Mode"})
+    
+    try:
+        import coindcx_client as cdx
+        pos_list = cdx.list_positions()
+        return jsonify({"positions": pos_list, "mode": "live", "error": None})
+    except Exception as e:
+        logger.error(f"Failed to fetch exchange positions: {e}")
+        return jsonify({"positions": [], "mode": "live", "error": str(e)})
+
+@app.route("/api/exchange-orders", methods=["GET"])
+def api_exchange_orders():
+    """Securely proxy physical orderbook history directly from the exchange."""
+    if config.PAPER_TRADE:
+        return jsonify({"open_orders": [], "history": [], "mode": "paper", "message": "Cannot fetch exchange orders in Paper Mode"})
+    
+    try:
+        import coindcx_client as cdx
+        # Physical Open Limit / Stop Orders active in Exchange Orderbook
+        open_orders = cdx.get_order_history(status="open", size=50)
+        # Historical Closed states (profits/losses mapped inside orders)
+        history = cdx.get_order_history(status="filled,cancelled,rejected", size=100)
+        return jsonify({"open_orders": open_orders, "history": history, "mode": "live", "error": None})
+    except Exception as e:
+        logger.error(f"Failed to fetch exchange orders: {e}")
+        return jsonify({"open_orders": [], "history": [], "mode": "live", "error": str(e)})
+
 
 
 @app.route("/api/health", methods=["GET"])
@@ -572,7 +686,11 @@ def api_close_trade():
                         ticker = cdx.get_ticker(cdx_pair)
                         if ticker:
                             actual_exit_price = float(ticker.get("last_price", 0))
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
                     pass
 
             except Exception as e:
@@ -608,7 +726,7 @@ def api_close_trade():
 def api_close_all():
     """Write a CLOSE_ALL command so main.py closes all open positions on next cycle."""
     try:
-        cmd = {"command": "CLOSE_ALL", "timestamp": datetime.utcnow().isoformat()}
+        cmd = {"command": "CLOSE_ALL", "timestamp": datetime.now(timezone.utc).isoformat()}
         with open(config.COMMANDS_FILE, "w") as f:
             json.dump(cmd, f)
         return jsonify({"success": True, "message": "CLOSE_ALL command queued"})
@@ -860,7 +978,7 @@ def api_set_mode():
     mode_config = {
         "mode": mode,
         "exchange": exchange,
-        "set_at": datetime.utcnow().isoformat(),
+        "set_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
         path = os.path.join(config.DATA_DIR, "engine_mode.json")
@@ -1089,6 +1207,17 @@ def _run_engine():
     _write_pid_lock()
     logger.info("🔒 Engine PID lock acquired (PID %d)", os.getpid())
 
+    # ── Start Independent Strategy Runner ─────────────────────────────
+    try:
+        from strategies.strategy_runner import StrategyRunner
+        import threading
+        _sr = StrategyRunner()
+        _sr_thread = threading.Thread(target=_sr.run_forever, daemon=True, name="StrategyRunner")
+        _sr_thread.start()
+        logger.info("✅ StrategyRunner thread spawned (Pyxis/Axiom/Ratio)")
+    except Exception as e:
+        logger.error("❌ Failed to start StrategyRunner: %s", e)
+
     try:
       _run_engine_inner()
     finally:
@@ -1157,7 +1286,11 @@ def _run_engine_inner():
                 f"Total crashes this boot: {_engine_crash_count}\n\n"
                 "⏳ Auto-recovery in 5 minutes..."
             )
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
         # Wait 5 minutes then try again (infinite recovery)
@@ -1173,7 +1306,11 @@ def _setup_sigterm_handler():
         if _engine_bot:
             try:
                 _engine_bot._running = False
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
         # Give the engine thread 15s to wind down
         if _engine_thread and _engine_thread.is_alive():
@@ -1182,7 +1319,11 @@ def _setup_sigterm_handler():
         try:
             if os.path.exists(_STARTUP_LOCK_FILE):
                 os.remove(_STARTUP_LOCK_FILE)
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
         logger.info("👋 Engine shut down cleanly after SIGTERM")
         sys.exit(0)
@@ -1257,7 +1398,11 @@ def api_force_signal():
                 df2 = compute_all_features(df)
                 if "atr" in df2.columns:
                     atr = float(df2["atr"].iloc[-1])
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
         quantity = (capital * leverage) / max(price, 0.0001)
@@ -1358,7 +1503,11 @@ def api_athena_log():
                 continue
             try:
                 rec = json.loads(ln)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 continue
             if symbol   and rec.get("symbol", "") != symbol:
                 continue
@@ -1370,7 +1519,11 @@ def api_athena_log():
                 try:
                     if rec.get("ts", "")[:10] < from_str[:10]:
                         continue
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
                     pass
             rows.append(rec)
             if len(rows) >= limit:
@@ -1434,7 +1587,11 @@ def api_broadcast_log():
                     # Apply bot_id filter — skip lines that don't match allowed bots
                     if allowed_bot_ids and entry["bot_id"] and entry["bot_id"] not in allowed_bot_ids:
                         continue
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
             parsed.append(entry)
             if len(parsed) >= n:
@@ -1462,7 +1619,11 @@ def api_restart():
     if _engine_bot:
         try:
             _engine_bot._running = False
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
     # Wait briefly for thread to die
@@ -1506,7 +1667,11 @@ def _engine_watchdog():
                     "Engine thread was found dead.\n"
                     "Auto-restarting now..."
                 )
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
             start_engine()
 
@@ -1600,10 +1765,43 @@ if __name__ == "__main__":
     # Install SIGTERM handler BEFORE starting anything else
     _setup_sigterm_handler()
 
-    # Start Flask API server
+    # Start Waitress WSGI production server
     port = int(os.environ.get("PORT", 3001))
-    logger.info("🌐 Engine API listening on port %d", port)
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    logger.info("🌐 Engine API listening on port %d (Waitress WSGI)", port)
+    from waitress import serve
+    serve(app, host="0.0.0.0", port=port, threads=8)
+# ─── Signal Validation System API ───────────────────────────────────────────
+
+@app.route("/api/signal-validation", methods=["GET"])
+def api_signal_validation():
+    """
+    Return SVS rolling accuracy report + recent signals.
+
+    Query params:
+      report  — ?report=1 (default) → full accuracy report JSON
+      signals — ?signals=1          → recent N signals (raw JSONL)
+      limit   — max signals to return (default 50, max 200)
+    """
+    try:
+        from signal_validator import get_svs
+        svs = get_svs()
+
+        want_signals = request.args.get("signals", "0") == "1"
+        limit = min(int(request.args.get("limit", 50)), 200)
+
+        if want_signals:
+            signals = svs.get_recent_signals(limit=limit)
+            return jsonify({
+                "signals": signals,
+                "count": len(signals),
+            })
+
+        report = svs.get_report()
+        return jsonify(report)
+
+    except Exception as e:
+        logger.error("signal-validation error: %s", e)
+        return jsonify({"error": str(e)}), 500
 
 
 # ─── Trade Journal: Exchange Health ──────────────────────────────────────────
@@ -1621,7 +1819,7 @@ def api_exchange_health():
             "exchange": None,
             "balance": 0,
             "openPositions": 0,
-            "checkedAt": datetime.utcnow().isoformat() + "Z",
+            "checkedAt": datetime.now(timezone.utc).isoformat() + "Z",
         })
     try:
         import coindcx_client as cdx
@@ -1629,7 +1827,11 @@ def api_exchange_health():
         try:
             positions = cdx.list_positions()
             pos_count = len(positions) if isinstance(positions, list) else 0
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pos_count = -1  # -1 = could not fetch position count
         return jsonify({
             "mode": "live",
@@ -1637,7 +1839,7 @@ def api_exchange_health():
             "exchange": config.EXCHANGE_LIVE or "coindcx",
             "balance": balance,
             "openPositions": pos_count,
-            "checkedAt": datetime.utcnow().isoformat() + "Z",
+            "checkedAt": datetime.now(timezone.utc).isoformat() + "Z",
         })
     except Exception as e:
         logger.warning("exchange-health: CoinDCX call failed: %s", e)
@@ -1648,5 +1850,5 @@ def api_exchange_health():
             "balance": 0,
             "openPositions": 0,
             "error": str(e),
-            "checkedAt": datetime.utcnow().isoformat() + "Z",
+            "checkedAt": datetime.now(timezone.utc).isoformat() + "Z",
         })

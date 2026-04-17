@@ -14,7 +14,7 @@ TESTNET = os.getenv("TESTNET", "true").lower() == "true"
 PAPER_TRADE = os.getenv("PAPER_TRADE", "true").lower() == "true"
 PAPER_USE_MAINNET           = True      # Use Binance MAINNET prices for paper trades (fixes testnet price divergence)
 PAPER_SIMULATED_SLIPPAGE_PCT = 0.05     # ±0.05% simulated market slippage on paper fills
-ENGINE_USER_ID = "cmmbvbo2l0000j1xo3rqvkfhz"  # Default user for engine trades (admin)
+ENGINE_USER_ID = os.getenv("ENGINE_USER_ID", "cmmbvbo2l0000j1xo3rqvkfhz")  # B3 FIX: Admin user — set ENGINE_USER_ID env var in Railway to avoid hardcoding
 ENGINE_BOT_ID  = os.getenv("ENGINE_BOT_ID", "")    # DB Bot.id — set in Railway per deployment
 ENGINE_BOT_NAME = os.getenv("ENGINE_BOT_NAME", "") # Human-readable bot name shown in trades UI
 ENGINE_ACTIVE_BOTS = []  # List of {bot_id, user_id, segment_filter} — refreshed every cycle from SaaS DB
@@ -31,6 +31,7 @@ COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 COINDCX_MARGIN_CURRENCY = os.getenv("COINDCX_MARGIN_CURRENCY", "USDT")
 EXCHANGE_LIVE = os.getenv("EXCHANGE_LIVE", "coindcx")  # "coindcx" (default) or "binance"
 BINANCE_FUTURES_TESTNET = os.getenv("BINANCE_FUTURES_TESTNET", "true").lower() == "true"
+REDIS_URL = os.getenv("REDIS_URL", "redis://default:arwwHDneBKbWLoVdqNcQvtKWKAUQzreP@redis.railway.internal:6379")
 
 # ─── Exchange Fees ──────────────────────────────────────────────────────────────
 TAKER_FEE = 0.0005            # 0.05% taker per leg (Binance & CoinDCX)
@@ -74,7 +75,7 @@ TIMEFRAME_MACRO = "4h"        # Macro regime (legacy — replaced by Multi-TF HM
 MULTI_TF_ENABLED = True               # Use 3 separate HMM brains per coin
 MULTI_TF_TIMEFRAMES = ["4h", "1h", "15m"]  # 4h (trend anchor), 1h (swing), 15m (momentum trigger)
 MULTI_TF_CANDLE_LIMIT = 1000          # Candles per TF (1000 for GMMHMM depth limit)
-MULTI_TF_WEIGHTS = {"4h": 30, "1h": 45, "15m": 25}  # Conviction weights (sum=100)
+MULTI_TF_WEIGHTS = {"4h": 45, "1h": 35, "15m": 20}  # Conviction weights (sum=100)
 MULTI_TF_MIN_AGREEMENT = 2            # Minimum TFs agreeing on direction (2 of 3)
 MULTI_TF_MIN_MODELS = 2               # Minimum trained models required
 
@@ -116,6 +117,7 @@ REGIME_BULL = 0
 REGIME_BEAR = 1
 REGIME_CHOP = 2
 REGIME_CRASH = 3              # Legacy — unused with HMM_N_STATES=3 (kept for backtester compat)
+REGIME_SIDEWAYS = REGIME_CHOP  # Alias used in _tick() regime fallback (main.py:517)
 
 REGIME_NAMES = {
     REGIME_BULL:  "BULLISH",
@@ -125,15 +127,26 @@ REGIME_NAMES = {
 }
 
 # ─── Leverage Tiers ─────────────────────────────────────────────────────────────
-LEVERAGE_HIGH = 35       # Confidence > 95%
-LEVERAGE_MODERATE = 25   # Confidence 91–95%
-LEVERAGE_LOW = 15        # Confidence 85–90%
-LEVERAGE_NONE = 1        # Observation mode
+# FIX-L1: Contrarian mode fades high-conviction signals → higher uncertainty →
+# max leverage capped at 15x (35x would wipe capital on a 2.86% adverse move).
+LEVERAGE_HIGH     = 10   # Flat 10x across all conviction tiers
+LEVERAGE_MODERATE = 10   # Flat 10x across all conviction tiers
+LEVERAGE_LOW      = 10   # Flat 10x across all conviction tiers
+LEVERAGE_NONE     =  1   # Observation mode
+
+# ─── Risk Constants ─────────────────────────────────────────────────────────────
+MAX_LOSS_PER_TRADE_PCT  : int   = 20   # Max % loss per trade before SL enforcement (used in Athena SL gate)
+STRATEGY_BOT_CAPITAL    : float = 100.0   # Capital per trade for Pyxis/Axiom/Ratio (aligned with $100/trade standard)
+STRATEGY_MAX_TRADES_PER_BOT: int = 10     # Max concurrent open trades per strategy bot-id (was 3/5/4 hardcoded)
+MAX_USER_TRADES_PER_MODE: int = 10        # Max active trades per bot per mode (paper/live) — 10 per bot, independent across bots
 
 # ─── Confidence Thresholds ──────────────────────────────────────────────────────
-CONFIDENCE_HIGH = 0.99   # Above 99% → 35x  (optimized from 0.95)
-CONFIDENCE_MEDIUM = 0.96 # 96–99% → 25x  (optimized from 0.91)
-CONFIDENCE_LOW = 0.92    # 92–96% → 15x  (optimized from 0.85, below 92% = no deploy)
+# FIX-C1: HMM margin confidence (best_prob - 2nd_best_prob) rarely exceeds 0.40
+# on crypto in practice. Previous values (0.99/0.96/0.92) effectively blocked
+# ALL trades from reaching the 35x/25x leverage tiers. Recalibrated to reality.
+CONFIDENCE_HIGH   = 0.30  # Margin > 0.30 → 15x  (previously 0.99 — unreachable)
+CONFIDENCE_MEDIUM = 0.20  # Margin 0.20–0.30 → 10x  (previously 0.96 — unreachable)
+CONFIDENCE_LOW    = 0.10  # Margin 0.10–0.20 → 7x   (previously 0.92 — unreachable)
 
 # ─── Capital per trade (used by all bots — uniform sizing) ─────────────────────
 CAPITAL_PER_TRADE = 100        # $100 per trade, fixed
@@ -141,19 +154,49 @@ CAPITAL_PER_TRADE = 100        # $100 per trade, fixed
 # ─── Risk Management ────────────────────────────────────────────────────────────
 RISK_PER_TRADE = 0.04
 KILL_SWITCH_DRAWDOWN = 0.10   # Pause bot if 10% drawdown in 24h
-MAX_LOSS_PER_TRADE_PCT = -25     # Hard max-loss per trade: -25% of capital
-MIN_LEVERAGE_FLOOR = 5           # Skip trade if leverage must drop below this
+
+# ─── 3-Phase DCA Strategy (PAUSED — full $100 deployed on entry) ─────────────────
+DCA_PAUSED = True   # ← set False to re-enable multi-phase DCA
+DCA_PHASES = [
+    { "level": 1, "trigger_pnl_pct":   0.0, "alloc_pct": 1.0,  "name": "Signal Entry (Full)" },
+    { "level": 2, "trigger_pnl_pct": -15.0, "alloc_pct": 0.30, "name": "Minor Sweep (paused)" },
+    { "level": 3, "trigger_pnl_pct": -35.0, "alloc_pct": 0.40, "name": "Deep Buy (paused)" }
+]
+DCA_HARD_STOP_PCT = -60.0    # Catastrophic stop-loss applied to blended PnL
+MAX_PROFIT_PER_TRADE_PCT =  25   # Hard max-profit per trade: +25% of capital
+MIN_LEVERAGE_FLOOR = 3           # Minimum acceptable leverage
+
+# ─── Fixed Leverage Override ────────────────────────────────────────────────────────
+# Every bot uses exactly this leverage. Set to None for dynamic per-signal leverage.
+FIXED_LEVERAGE = 10   # ← 10× across all bots
 MIN_HOLD_MINUTES = 30         # Minimum hold time before regime-change exits
 DEFAULT_QUANTITY = 0.002      # BTC quantity (overridden by position sizer)
 MARGIN_TYPE = "ISOLATED"      # Never use CROSS for high leverage
 
+# ─── Trade Duration Cap (Stall Exit) ────────────────────────────────────────────
+# FIX-D1: Trades that are stuck (PnL between -STUCK% and +STUCK%) after MAX_AGE hours
+# are burning capital. Auto-close them to free margin for better opportunities.
+# The stall exit fires only when BOTH conditions are met:
+#   1. Trade age >= TRADE_MAX_AGE_HOURS
+#   2. Absolute PnL% <= TRADE_STUCK_PNL_PCT (trade going nowhere)
+TRADE_MAX_AGE_HOURS    = 24    # Close stalled trades after 24h (4h was too short at 10x — most swings need time)
+TRADE_STUCK_PNL_PCT    = 15.0  # Only exit if |PnL%| < 15% (= <1.5% price move at 10x). Wider band = fewer false stalls.
+
+# ─── Mid-Trade Regime Exit ───────────────────────────────────────────────────────
+# FIX-R1: If HMM regime flips AGAINST the trade direction while the trade is open,
+# soft-close the position after REGIME_EXIT_HOLD_CYCLES cycles of confirmation.
+# Prevents holding LONG positions through a BULL→BEAR regime transition.
+REGIME_EXIT_ENABLED        = True
+REGIME_EXIT_HOLD_CYCLES    = 3    # Require 3 consecutive adverse regime cycles (was 2). Avoids noise-driven exits.
+
 # ─── Stop Loss / Take Profit ────────────────────────────────────────────────────
 
 # Percentage-based partial profit booking (Trigger PnL %, Fraction_of_Remaining_Qty, Milestone_Name)
+# Standard booking ladder — locks profit incrementally, lets winners run to full TP.
 PARTIAL_BOOKING_STEPS = [
-    ( 30.0, 0.33, "TP1" ),   # At +30% PnL: Sell ~33% of original position.
-    ( 60.0, 0.50, "TP2" ),   # At +60% PnL: Sell 50% of remaining (another ~33% of original).
-    (100.0, 1.00, "TP3" ),   # At +100% PnL: Sell the rest (Full Close).
+    ( 20.0, 0.33, "TP1" ),   # +20% leveraged PnL (~2% price move at 10x): Book a third early
+    ( 35.0, 0.50, "TP2" ),   # +35% leveraged PnL (~3.5% price move at 10x): Half of remaining
+    ( 60.0, 1.00, "TP3" ),   # +60% leveraged PnL (~6% price move at 10x): Full close
 ]
 
 ATR_SL_MULTIPLIER = 1.5       # SL = ATR * multiplier (DEFAULT, used as fallback)
@@ -203,7 +246,7 @@ BB_STD = 2.0
 RSI_LENGTH = 14
 RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
-SIDEWAYS_POSITION_REDUCTION = 0.30  # 30% smaller positions in chop
+SIDEWAYS_POSITION_REDUCTION = 0.15  # 15% smaller positions in chop (adjusted by Athena Swarm)
 
 # ─── Bot Loop ────────────────────────────────────────────────────────────────────
 LOOP_INTERVAL_SECONDS = 10        # 10-second heartbeat (faster trailing SL sync)
@@ -211,7 +254,7 @@ ANALYSIS_INTERVAL_SECONDS = 300   # 5-minute full analysis cycle
 ERROR_RETRY_SECONDS = 60          # Retry after error
 
 # Min HMM conviction to pass to Athena (below this, coin is skipped before Athena call)
-MIN_CONVICTION_FOR_DEPLOY = 65    # 65 out of 100 — matches MultiTFHMMBrain conviction scale (0-100)
+MIN_CONVICTION_FOR_DEPLOY = 60    # 60 out of 100 — matches MultiTFHMMBrain conviction scale (0-100)
 TOP_COINS_PER_SEGMENT = 1         # Athena evaluates the single highest-HMM coin per segment
 
 # ─── Deploy Waterfall ────────────────────────────────────────────────────────────
@@ -219,8 +262,13 @@ ATHENA_WATERFALL_DEPTH = 4        # How many coins to send to Athena per bot (fa
 MAX_DEPLOYS_PER_BOT_PER_CYCLE = 3 # Deploy up to N coins per bot per cycle (prevents signal loss on segment rotation)
 
 # ─── Multi-Coin Trading ──────────────────────────────────────────────────────────
-MAX_CONCURRENT_POSITIONS = 10   # Max symbols traded at once (reduced from 15)
-MAX_OPEN_TRADES = 25            # User-configurable max (overridden by /api/set-config at bot start)
+# FIX-E1: Portfolio exposure ceiling. All altcoins are ~0.85 correlated to BTC.
+# 25 open positions at 25x ≈ 85% of capital wiped on a single 4% BTC crash.
+# Cap at 6 concurrent max. With 10 segments × 1 trade max = natural max is 10,
+# but exposure ceiling enforces hard stop at 6.
+MAX_CONCURRENT_POSITIONS = 6    # Portfolio exposure ceiling (down from 10 — exposure-coach fix)
+MAX_OPEN_TRADES = 10            # User-configurable max (overridden by /api/set-config at bot start)
+MAX_DCA_DISTRESS_TRADES = 2     # Max number of trades allowed in DCA Phase 2/3 before system freezes new entries
 TOP_COINS_LIMIT = 50            # Max coins to scan (brain switcher may reduce: 15/30/50)
 CAPITAL_PER_COIN_PCT = 0.05     # 5% of balance per coin (max 15 = 75% deployed)
 SCAN_INTERVAL_CYCLES = 4        # Re-scan top coins every N analysis cycles (4 × 15m = 1h)
@@ -310,7 +358,7 @@ LLM_API_KEY                 = os.getenv("GEMINI_API_KEY", "")  # Env var name un
 LLM_MODEL                   = "gpt-4o"                         # Strongest reasoning, excellent JSON adherence
 LLM_CACHE_MINUTES           = 10                               # Cache per-coin LLM decisions
 LLM_TIMEOUT_SECONDS         = 30                               # API timeout
-LLM_VETO_THRESHOLD          = 0.80                             # Below this → LLM vetoes the trade (raised from 0.65)
+LLM_VETO_THRESHOLD          = 0.60                             # Below this → LLM vetoes the trade (dropped to 0.60 for scaled execution)
 BTC_MACRO_COUNTER_THRESHOLD = 0.80                             # Counter-macro trades need ≥80% Athena conf (LONG in bearish / SHORT in bullish)
 LLM_CONFIDENCE_WEIGHT       = 0.20                             # LLM can adjust conviction by ±20%
 LLM_MAX_CALLS_PER_CYCLE     = 10                               # Rate limit: max N Athena calls per cycle
@@ -359,14 +407,13 @@ ORDERFLOW_LARGE_ORDER_USD  = 50_000    # USD threshold to flag a single order as
 
 # ─── Conviction Score Weights (must sum to 100) ───────────────────────────────
 # EXP 4 IC-guided weight optimization (300 trials) — Sharpe +0.2442 improvement
-CONVICTION_WEIGHT_HMM       = 60   # HMM regime confidence 
-CONVICTION_WEIGHT_FUNDING   = 15   # Funding rate (contrarian signal)
+CONVICTION_WEIGHT_HMM       = 60   # HMM regime confidence
+CONVICTION_WEIGHT_FUNDING   = 15   # Funding rate carry signal
 CONVICTION_WEIGHT_OI        = 10   # Open Interest change
-CONVICTION_WEIGHT_ORDERFLOW = 15   # Live L2 / Limit Liquidity Tracker
 CONVICTION_WEIGHT_ORDERFLOW = 15   # Live L2 / Limit Liquidity Tracker
 
 # ─── Conviction Score: Leverage Bands ────────────────────────────────────────
-CONVICTION_MIN_TRADE   = 65   # Below this → no trade (leverage = 0)
+CONVICTION_MIN_TRADE   = 60   # Below this → no trade (leverage = 0)
 CONVICTION_BAND_LOW    = 75   # 65–74  → 15x leverage
 CONVICTION_BAND_MED    = 95   # 75–94  → 25x leverage; 95+ → 35x leverage
 
@@ -407,6 +454,22 @@ DEFAULT_FUNDING_RATE   = 0.0001     # 0.01% per 8h — typical Binance/CoinDCX r
 COINDCX_MIN_NOTIONAL      = 120.0   # Minimum order size in USD
 COINDCX_ORDER_SETTLE_SLEEP = 0.5    # Seconds to wait after placing order
 
+
+
 # ─── Coin Scanner ────────────────────────────────────────────────────────────
 SCANNER_RATE_LIMIT_SLEEP = 1.0   # Seconds between API calls to avoid rate limiting
 
+# ─── AI4Trade Integration (ai4trade.ai / HKUDS/AI-Trader) ────────────────────
+# Enables Synaptic to publish trades + participate in agent-to-agent discussions.
+# Credentials come from environment variables — never hardcode here.
+#
+#   Railway env vars to set:
+#     AI4TRADE_EMAIL      — bot account email
+#     AI4TRADE_PASSWORD   — bot account password
+#     AI4TRADE_TOKEN      — auto-populated after first registration; paste back in
+#
+AI4TRADE_ENABLED         : bool  = True    # Master switch. Set True once creds are set.
+AI4TRADE_AGENT_NAME      : str   = "Synaptic-HMM-Engine"
+AI4TRADE_MIN_CONVICTION  : float = 70.0    # Only publish trades with conviction >= this
+AI4TRADE_POST_STRATEGY   : bool  = True    # Post HMM cycle summary as strategy discussion
+AI4TRADE_STRATEGY_EVERY_N: int   = 5       # Post strategy every N cycles (not every cycle)

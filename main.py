@@ -10,6 +10,7 @@ import time
 import logging
 import threading
 import urllib.request
+import redis
 from datetime import datetime, timezone, timedelta
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -18,6 +19,36 @@ import config
 from hmm_brain import HMMBrain, MultiTFHMMBrain
 from data_pipeline import fetch_klines, get_multi_timeframe_data, _get_binance_client
 from feature_engine import compute_all_features, compute_hmm_features, compute_trend, compute_ema
+
+# ── Hoisted Local Imports ──
+from ai4trade_client import AI4TradeClient
+from state_manager import StateManager
+from coin_analyzer import CoinAnalyzer
+from risk_manager import RiskManager
+from data_pipeline import fetch_klines
+from data_pipeline import fetch_klines as _fk
+from data_pipeline import fetch_klines as _prefetch
+from datetime import timezone
+from dateutil import parser as _dp
+from engine_api import pull_active_bots_from_saas
+from feature_engine import compute_all_features
+from feature_engine import compute_trend
+from strategies.strategy_runner import StrategyRunner
+import coindcx_client as cdx
+import datetime as _dt
+import json
+import json as _jl, datetime as _dl
+import json as _jp, datetime as _dp
+import json as _json
+import json as _json_tmp
+import json as _jvl
+import numpy as _np
+import os
+import re
+import requests as _req
+import telegram as _tg
+import time as _t
+
 from execution_engine import ExecutionEngine
 from risk_manager import RiskManager
 from coin_scanner import get_top_coins_by_volume, get_active_bot_segment_pool
@@ -29,6 +60,7 @@ import coindcx_client as cdx
 from llm_reasoning import AthenaEngine
 from price_stream import get_price_stream, shutdown_price_stream
 from segment_features import get_segment_for_coin  # promoted from inline import — needed at line ~1350
+from signal_validator import get_svs  # Signal Validation System
 # ─── Logging Setup ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +92,7 @@ _bcast_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt
 broadcast_logger = logging.getLogger("signal_broadcast")
 broadcast_logger.setLevel(logging.INFO)
 broadcast_logger.addHandler(_bcast_handler)
+broadcast_logger.propagate = False  # Don't duplicate to root bot.log
 broadcast_logger.propagate = False  # Don't duplicate to bot.log
 
 def _bcast(event: str, cycle: int, bot_name: str, bot_id: str, sym: str, side: str = "",
@@ -82,7 +115,7 @@ def _log_athena_decision(
     price: float, sl: float, tp: float, summary: str,
 ) -> None:
     """Append one JSONL record to the Athena decision history log."""
-    import json as _jl, datetime as _dl
+
     record = {
         "ts":         _dl.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cycle":      cycle,
@@ -100,13 +133,17 @@ def _log_athena_decision(
         os.makedirs(os.path.dirname(_ATHENA_LOG_FILE) or ".", exist_ok=True)
         with open(_ATHENA_LOG_FILE, "a", encoding="utf-8") as _af:
             _af.write(_jl.dumps(record) + "\n")
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass  # Never block engine on log write failure
 
 
 def _purge_old_athena_log(days: int = 30) -> None:
     """Remove entries older than `days` from the Athena decision JSONL on startup."""
-    import json as _jp, datetime as _dp
+
     if not os.path.exists(_ATHENA_LOG_FILE):
         return
     cutoff = _dp.datetime.utcnow() - _dp.timedelta(days=days)
@@ -119,21 +156,38 @@ def _purge_old_athena_log(days: int = 30) -> None:
                 ts_str = _jp.loads(ln).get("ts", "")
                 if ts_str and _dp.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ") >= cutoff:
                     kept.append(ln)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 kept.append(ln)  # Keep malformed lines rather than lose data
         if len(kept) < len(lines):
             with open(_ATHENA_LOG_FILE, "w", encoding="utf-8") as _f:
                 _f.writelines(kept)
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
 
 
 _purge_old_athena_log()  # Run once at module load
 
 
-def _build_pos_key(bot_id: str, symbol: str) -> str:
-    """Build position key: 'bot_id:symbol' if bot_id is non-empty, else 'symbol'."""
-    return f"{bot_id}:{symbol}" if bot_id else symbol
+def _build_pos_key(bot_id: str, symbol: str, user_id: str = "") -> str:
+    """Build position key: 'user_id:bot_id:symbol' for full per-user isolation.
+
+    Including user_id ensures User A's BTTCUSDT does NOT block User B from
+    getting the same coin under the same bot — each user is fully independent.
+    Falls back gracefully when user_id is absent (legacy / single-user mode).
+    """
+    if user_id and bot_id:
+        return f"{user_id}:{bot_id}:{symbol}"
+    if bot_id:
+        return f"{bot_id}:{symbol}"
+    return symbol
 
 
 # ─── Bot name → segment mapping (fallback when segment_filter not in ENGINE_ACTIVE_BOTS) ──
@@ -189,21 +243,33 @@ class RegimeMasterBot:
 
         # ── Critical deps — wrapped to prevent init crashes from burning retries ──
         try:
-            self.executor = ExecutionEngine()
+            self.executor = ExecutionEngine(engine=self)
         except Exception as e:
             logger.error("⚠️ ExecutionEngine init failed: %s — using fallback", e)
-            self.executor = ExecutionEngine()  # retry once
+            self.executor = ExecutionEngine(engine=self)  # retry once
 
         try:
-            self.risk = RiskManager()
+            self.risk = RiskManager(engine=self)
         except Exception as e:
             logger.error("⚠️ RiskManager init failed: %s — using fallback", e)
-            self.risk = RiskManager()
+            self.risk = RiskManager(engine=self)
 
         self._trade_count = 0
         self._cycle_count = 0
         self._last_cycle_duration = 0
         self._last_analysis_time = 0.0  # epoch — triggers immediate first run
+        self._deploying_locks = {}      # (user_id, bot_id, sym) -> timestamp
+        
+        # Redis Client for state caching
+        try:
+            self._redis = redis.from_url(config.REDIS_URL, decode_responses=True)
+        except Exception as e:
+            logger.error("⚠️ Redis init failed: %s — state will not be broadcast to UI", e)
+            self._redis = None
+            
+        self.state_manager = StateManager(self)
+        self.coin_analyzer = CoinAnalyzer(self)
+        self.risk_manager = RiskManager(self)
 
         # Multi-coin state
         self._coin_list = []
@@ -212,7 +278,7 @@ class RegimeMasterBot:
         self._multi_tf_brains = {}   # symbol → MultiTFHMMBrain (3 TFs per coin)
         self._coin_states = {}       # symbol → latest state dict (for dashboard)
         self._live_prices = {}       # symbol → {ls, fr, ...} (fetched each cycle)
-        self._BRAIN_CACHE_MAX = 5    # LRU eviction cap (down from 20) — strict limit protects Railway 300MB RAM tier from OOM kills
+        self._BRAIN_CACHE_MAX = 40   # LRU eviction cap — elevated to 40 for 32-coin array handling
 
         # ── Signal Queue ────────────────────────────────────────────────────────
         # Stores HMM-qualified signals that couldn't deploy this cycle (no bots,
@@ -246,7 +312,7 @@ class RegimeMasterBot:
         try:
             _state_path = getattr(config, "MULTI_STATE_FILE", None)
             if _state_path and os.path.exists(_state_path):
-                import json as _json_tmp
+
                 with open(_state_path, "r") as _f:
                     _stale = _json_tmp.load(_f)
                 _stale["pending_signals_count"] = 0
@@ -254,7 +320,11 @@ class RegimeMasterBot:
                 with open(_state_path, "w") as _f:
                     _json_tmp.dump(_stale, _f, indent=2)
                 logger.info("🧹 Startup: cleared stale signal queue from persisted state")
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass  # Non-fatal — state will be overwritten after first cycle anyway
 
         # ── Veto Log ────────────────────────────────────────────────────────────
@@ -262,13 +332,14 @@ class RegimeMasterBot:
         # so the cockpit can retrospectively check what happened to the vetoed coin.
         self._veto_log: list = []   # [{symbol, price, side, conviction, reason, ts}]
         self._VETO_LOG_MAX = 50     # keep last 50 vetoes
+        self._balance_alert_last_sent: float = 0.0  # cooldown for zero-balance spam
 
         # ── Startup: restore veto log from persisted state ──────────────────────
         # Without this, every restart wipes the veto history shown in the cockpit.
         try:
             _vl_path = getattr(config, "MULTI_STATE_FILE", None)
             if _vl_path and os.path.exists(_vl_path):
-                import json as _jvl
+
                 with open(_vl_path, "r") as _fv:
                     _persisted = _jvl.load(_fv)
                 _saved_vetoes = _persisted.get("veto_log", [])
@@ -276,7 +347,11 @@ class RegimeMasterBot:
                     # State file stores newest-first (reversed); restore to oldest-first for append
                     self._veto_log = list(reversed(_saved_vetoes))[-self._VETO_LOG_MAX:]
                     logger.info("🔁 Restored %d veto log entries from previous session", len(self._veto_log))
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass  # Non-fatal — clean veto log is acceptable fallback
 
 
@@ -324,6 +399,16 @@ class RegimeMasterBot:
             logger.warning("⚠️ PriceStream failed to start: %s — will fall back to REST", e)
             self._price_stream = None
 
+        # ── AI4Trade Integration (ai4trade.ai) ─────────────────────────
+        self._ai4trade = None
+        if getattr(config, "AI4TRADE_ENABLED", False):
+            try:
+
+                self._ai4trade = AI4TradeClient()
+                config.AI4TRADE_CLIENT = self._ai4trade
+            except Exception as e:
+                logger.warning("⚠️  AI4Trade client failed to init: %s", e)
+
     # ─── Main Loop ───────────────────────────────────────────────────────────
 
     def run(self):
@@ -338,6 +423,24 @@ class RegimeMasterBot:
             "⏱ Heartbeat: %ds | Full analysis: every %ds",
             config.LOOP_INTERVAL_SECONDS, config.ANALYSIS_INTERVAL_SECONDS,
         )
+
+        # ── Start Telegram command handler (menu / polling) ─────────────────────────
+        def _close_all_trades():
+            """Injected into the Telegram handler for /closeall confirm."""
+            import tradebook as _tb
+            active = _tb.get_all_active_trades()
+            for t in active:
+                try:
+                    _tb.close_trade(symbol=t["symbol"], reason="TELEGRAM_CLOSEALL")
+                except Exception as _ce:
+                    logger.error("closeall error for %s: %s", t.get("symbol"), _ce)
+            logger.warning("⚠️ /closeall via Telegram: closed %d trades", len(active))
+
+        try:
+            tg.register_engine_ref(self, close_all_fn=_close_all_trades)
+            tg.start_command_handler()
+        except Exception as _te:
+            logger.warning("Telegram command handler failed to start: %s", _te)
 
         while self._running:
             try:
@@ -354,7 +457,7 @@ class RegimeMasterBot:
                 err_str = str(e)
                 # ── Binance IP ban: parse expiry and sleep until it passes ──
                 if 'banned until' in err_str and '-1003' in err_str:
-                    import re
+
                     m = re.search(r'banned until (\d+)', err_str)
                     if m:
                         ban_until_ms = int(m.group(1))
@@ -399,7 +502,11 @@ class RegimeMasterBot:
                                     logger.warning("⏸️  Engine HALTED: %s (%.0f min remaining)", reason, remaining)
                                     self._pause_logged = True
                                 return  # Still halted
-                        except Exception:
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
                             pass
                     else:
                         # Manual pause (no expiry)
@@ -408,7 +515,11 @@ class RegimeMasterBot:
                             self._pause_logged = True
                         return  # Skip entire heartbeat
             self._pause_logged = False
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
         # Always: process commands (kill switch / reset)
@@ -430,7 +541,11 @@ class RegimeMasterBot:
                     fr = float(info.get("fr", 0)) or float(info.get("efr", 0))
                     if fr != 0:
                         funding_rates[sym] = fr
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
                     pass
 
             # ── WebSocket price feed: ensure active symbols are subscribed ──
@@ -461,8 +576,8 @@ class RegimeMasterBot:
                 all_active_syms = list({t['symbol'] for t in tradebook.get_active_trades() if t.get('symbol')})
                 missing_syms = [s for s in all_active_syms if s not in ws_prices]
                 if missing_syms:
-                    import requests as _req
-                    import json as _json
+
+
                     _resp = _req.get(
                         "https://api.binance.com/api/v3/ticker/price",
                         params={"symbols": _json.dumps(missing_syms)},
@@ -478,10 +593,62 @@ class RegimeMasterBot:
             except Exception as _rest_err:
                 logger.debug("REST supplement price fetch failed: %s", _rest_err)
 
-            # Pass combined prices (WS + REST supplement) to update_unrealized
+            # Merge the engine's global live prices (which contains Paper/CoinDCX feeds)
+            # over the Binance ws_prices to guarantee no paper-trade fallback latency.
+            if hasattr(self, '_live_prices') and isinstance(self._live_prices, dict):
+                for _k, _v in self._live_prices.items():
+                    if _k not in ws_prices and 'price' in _v:
+                        ws_prices[_k] = float(_v['price'])
+                    elif _k not in ws_prices and isinstance(_v, (int, float)):
+                         ws_prices[_k] = float(_v)
+
+            # Pass combined prices (WS + REST supplement + Live Cache) to update_unrealized
             tradebook.update_unrealized(funding_rates=funding_rates, prices=ws_prices or None)
         except Exception as e:
             logger.warning("⚠️ Tradebook unrealized update error (max-loss/SL/TP guards may not have run): %s", e, exc_info=True)
+
+        # ── SVS: evaluate pending signals whose window has elapsed ───────────
+        try:
+            get_svs().evaluate_pending()
+        except Exception as _svs_e:
+            logger.debug("SVS evaluate_pending error: %s", _svs_e)
+
+        # ── FIX-R1: Mid-Trade Regime Exit ────────────────────────────────────
+        # If HMM flips AGAINST an open trade for N consecutive cycles → close it.
+        # Runs every heartbeat (10s) so regime changes are caught quickly.
+        if getattr(config, "REGIME_EXIT_ENABLED", False):
+            try:
+                _hold_cycles = getattr(config, "REGIME_EXIT_HOLD_CYCLES", 2)
+                _open_trades = tradebook.get_active_trades()
+                for _ot in _open_trades:
+                    _sym   = _ot.get("symbol")
+                    _dir   = _ot.get("direction", "").upper()   # "LONG" or "SHORT"
+                    if not _sym or not _dir:
+                        continue
+                    # Look up current HMM consensus from coin_states cache
+                    _state = self._coin_states.get(_sym, {})
+                    _regime_int = _state.get("regime_int", config.REGIME_SIDEWAYS)
+                    # Determine if current regime is adverse to the open trade
+                    _adverse = (
+                        (_dir == "LONG"  and _regime_int == config.REGIME_BEAR) or
+                        (_dir == "SHORT" and _regime_int == config.REGIME_BULL)
+                    )
+                    if _adverse:
+                        _ot["_regime_adverse_count"] = _ot.get("_regime_adverse_count", 0) + 1
+                        if _ot["_regime_adverse_count"] >= _hold_cycles:
+                            logger.info(
+                                "🔄 REGIME EXIT on %s — %s trade open but HMM regime adverse for %d cycles. Closing.",
+                                _sym, _dir, _ot["_regime_adverse_count"],
+                            )
+                            tradebook.close_trade(
+                                _ot["trade_id"], reason=f"REGIME_FLIP"
+                            )
+                    else:
+                        # Reset counter if regime aligns again (handle regime noise)
+                        _ot["_regime_adverse_count"] = 0
+            except Exception as _re:
+                logger.debug("Regime exit check error: %s", _re)
+
 
         # Live mode: sync CoinDCX positions → tradebook → trailing SL/TP
         if not config.PAPER_TRADE:
@@ -500,7 +667,11 @@ class RegimeMasterBot:
         if force:
             try:
                 os.remove(trigger_file)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
             logger.info("⚡ Manual cycle trigger received from dashboard!")
 
@@ -530,12 +701,27 @@ class RegimeMasterBot:
             multi["analysis_interval_seconds"] = config.ANALYSIS_INTERVAL_SECONDS
             with open(config.MULTI_STATE_FILE, "w") as f:
                 json.dump(multi, f, indent=2)
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             pass
 
     def _tick(self):
         """Full analysis cycle — runs every ANALYSIS_INTERVAL_SECONDS."""
         cycle_start = time.time()
+
+        # Dynamic Isolation: Only run the HMM ML engine for bots that are NOT
+        # handled by strategy_runner.py (Pyxis/Axiom/Ratio have their own runner).
+        # If ALL active bots are systematic bots → skip HMM _tick() entirely.
+        _SYSTEMATIC_PREFIXES = {"pyxis", "axiom", "ratio"}
+        active_bot_prefixes = {b.get("bot_name", "").split()[0].lower() for b in config.ENGINE_ACTIVE_BOTS}
+        hmm_bot_prefixes = active_bot_prefixes - _SYSTEMATIC_PREFIXES
+        if not active_bot_prefixes or not hmm_bot_prefixes:
+            logger.info("💤 Skipping ML Regime _tick() — no HMM bots registered (only Pyxis/Axiom/Ratio are active).")
+            return
+
         self._cycle_count += 1
         _cycle_ts = datetime.utcnow().isoformat() + "Z"
 
@@ -595,7 +781,7 @@ class RegimeMasterBot:
         # Engine is the pull side — no push/registration required.
         # This self-heals after every Railway redeploy without any dashboard visit.
         try:
-            from engine_api import pull_active_bots_from_saas
+
             pull_active_bots_from_saas()
         except Exception as _pab_err:
             logger.warning("⚠️  Bot pull failed: %s", _pab_err)
@@ -616,7 +802,7 @@ class RegimeMasterBot:
             # Pre-warm BTC 1h kline cache before analysis to avoid race conditions
             # (two engine threads both try to fetch BTCUSDT:1h simultaneously on fresh start)
             try:
-                from data_pipeline import fetch_klines as _prefetch
+
                 _btc_warm = _prefetch("BTCUSDT", config.TIMEFRAME_CONFIRMATION, limit=config.HMM_LOOKBACK)
                 if _btc_warm is not None and len(_btc_warm) >= 60:
                     logger.debug("🔥 BTC 1h klines pre-warmed (%d candles)", len(_btc_warm))
@@ -626,28 +812,29 @@ class RegimeMasterBot:
             except Exception as _pw_err:
                 logger.warning("⚠️  BTC 1h pre-warm exception: %s", _pw_err)
 
-            # Always refresh the segment heatmap JSON every cycle (cheap Binance ticker call)
-            # This keeps the dashboard heatmap live even when the pool is not being rebuilt
-            try:
-                # Find which segments are currently blocked across the engine
-                blocked_segments = {seg for seg in config.CRYPTO_SEGMENTS.keys() if self._is_segment_in_cooldown(seg)[0]}
-                
-                from coin_scanner import get_hottest_segments as _refresh_heatmap
-                _refresh_heatmap(getattr(config, "SEGMENT_SCAN_LIMIT", 2), blocked_segments)
-            except Exception as _he:
-                logger.warning("⚠️  Heatmap refresh failed (non-fatal): %s", _he)
-
             # ── Market Structure Analysis (Removed) ─────────────
 
             # Refresh the full coin pool every N cycles (or on first run)
             refresh_rotations = max(1, self._SCAN_POOL_SIZE // self._SCAN_BATCH_SIZE)
             if not self._full_coin_pool or self._cycle_count % max(1, config.SCAN_INTERVAL_CYCLES * refresh_rotations) == 1:
                 # Find which segments are currently blocked across the engine
-                blocked_segments = {seg for seg in config.CRYPTO_SEGMENTS.keys() if self._is_segment_in_cooldown(seg)[0]}
+                blocked_segments = {seg for seg in config.CRYPTO_SEGMENTS.keys() if self.risk_manager.is_segment_in_cooldown(seg)[0]}
                 
                 logger.info("🔄 Refreshing Segment-First coin pool based on %d active bots (excluding %d blocked segments)...", 
                             len(config.ENGINE_ACTIVE_BOTS), len(blocked_segments))
-                self._full_coin_pool = get_active_bot_segment_pool(config.ENGINE_ACTIVE_BOTS, blocked_segments)
+                narrative_pool = get_active_bot_segment_pool(config.ENGINE_ACTIVE_BOTS, blocked_segments)
+                
+                # Expand pool with the Top 100 Dynamic Systematic Universe
+                from data_pipeline import get_dynamic_systematic_universe
+                systematic_pool = get_dynamic_systematic_universe(limit=100) or []
+                self._systematic_pool = systematic_pool # Save for the UI to read
+                
+                # Merge maintaining BTCUSDT at index 0
+                merged = set(narrative_pool + systematic_pool)
+                if config.PRIMARY_SYMBOL in merged:
+                    merged.remove(config.PRIMARY_SYMBOL)
+                self._full_coin_pool = [config.PRIMARY_SYMBOL] + sorted(list(merged))
+                
                 logger.info("📋 Full pool (%d coins): %s ...",
                             len(self._full_coin_pool), ", ".join(self._full_coin_pool[:8]))
 
@@ -718,20 +905,30 @@ class RegimeMasterBot:
                 "Check CoinDCX API keys and wallet."
             )
             try:
-                tg.send_message(
-                    "🚨 *BALANCE ALERT*\n\n"
-                    "CoinDCX balance returned $0 after 3 retries.\n"
-                    "Deployments are PAUSED until balance is available.\n\n"
-                    "Possible causes:\n"
-                    "• Empty futures wallet\n"
-                    "• Invalid API keys\n"
-                    "• CoinDCX API downtime"
-                )
-            except Exception:
+                # Only alert once per hour — balance=0 can persist across many cycles
+                _now = time.time()
+                if _now - self._balance_alert_last_sent >= 3600:
+                    self._balance_alert_last_sent = _now
+                    tg.send_message(
+                        "\ud83d\udea8 <b>BALANCE ALERT</b>\n"
+                        "CoinDCX balance returned $0 after 3 retries.\n"
+                        "Deployments are PAUSED until balance is available.\n\n"
+                        "Possible causes:\n"
+                        "• Empty futures wallet\n"
+                        "• Invalid API keys\n"
+                        "• CoinDCX API downtime"
+                    )
+                else:
+                    logger.debug("[Telegram] balance-alert cooldown active — suppressed")
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
             # Still run exits and state save, but skip new deployments
             self._check_exits(symbols)
-            self._save_multi_state(symbols, [], 0)
+            self.state_manager.save_multi_state(symbols, [], 0)
             return
 
         self.risk.record_equity(balance)
@@ -743,7 +940,11 @@ class RegimeMasterBot:
                 current = self.risk.equity_history[-1][1] if self.risk.equity_history else 0
                 dd = (peak - current) / peak * 100 if peak > 0 else 0
                 tg.notify_kill_switch(dd, peak, current)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
             for sym in list(self._active_positions.keys()):
                 tradebook.close_trade(symbol=sym, reason="KILL_SWITCH")
@@ -760,12 +961,10 @@ class RegimeMasterBot:
         tradebook_active_count = len(tradebook_active)
         raw_results = []
 
-        # Scan ALL symbols — do NOT skip based on other bots' deployed coins.
-        # Each bot has its own position check (pos_key = bot_id:symbol).
-        # If Synaptic Adaptive deployed ETH, L1 Specialist should still scan + deploy it.
-        # BTCUSDT is the macro regime reference for every coin's conviction score.
-        # It must be analyzed on EVERY cycle regardless of which batch rotation is active.
-        scan_symbols = symbols if "BTCUSDT" in symbols else ["BTCUSDT"] + list(symbols)
+        # Ensure BTCUSDT is evaluated FIRST for the short-circuit optimization.
+        scan_symbols = [s for s in symbols if s != "BTCUSDT"]
+        scan_symbols.insert(0, "BTCUSDT")
+
         logger.info("📡 Initial Scan list: %d coins | active trades in book: %d",
                     len(scan_symbols), tradebook_active_count)
 
@@ -796,7 +995,49 @@ class RegimeMasterBot:
                 logger.info("🚫 Skipping %s (Exclusion List)", symbol)
                 continue
             try:
-                result = self._analyze_coin(symbol, balance, btc_flash_crash=btc_flash_crash)
+                result = self.coin_analyzer.analyze_coin(symbol, balance, btc_flash_crash=btc_flash_crash)
+
+                # ── NEW: Short-circuit optimization for BTC Chop ──
+                # If BTC evaluated to CHOP, do NOT waste 2-3 minutes analyzing 30 altcoins.
+                # Abort the loop, as the deployments will be blocked downstream anyway.
+                if symbol == "BTCUSDT":
+                    _btc_state = self._coin_states.get("BTCUSDT", {})
+                    _btc_regime_str = _btc_state.get("regime", "UNKNOWN")
+                    _btc_regime_int = _btc_state.get("regime_int")
+                    _btc_is_chop = False
+                    
+                    if _btc_regime_int is not None:
+                        _btc_is_chop = (_btc_regime_int == config.REGIME_CHOP)
+                    else:
+                        if "4h=SIDEWAYS/CHOP" in _btc_regime_str or "4h=CHOP" in _btc_regime_str:
+                             _btc_is_chop = True
+                        elif _btc_regime_str in ("SIDEWAYS", "CHOP", "SIDEWAYS/CHOP"):
+                             _btc_is_chop = True
+                        # NOTE: UNKNOWN is NOT treated as CHOP — engine startup
+                        # produces UNKNOWN before BTC has been analyzed. Treating
+                        # UNKNOWN as chop triggers the short-circuit break and
+                        # skips ALL altcoin scanning for the entire first cycle.
+                             
+                    bots = config.ENGINE_ACTIVE_BOTS
+                    bot_names = [b.get("bot_name", "").lower() for b in bots]
+                    allow_btc_bypass = any("rogue" in bn or "vanguard" in bn for bn in bot_names)
+                             
+                    if _btc_is_chop and not allow_btc_bypass:
+                        logger.warning("⛔ MACRO VETO OPTIMIZATION: Bitcoin is CHOP (%s). Aborting HMM analysis for remaining %d coins to save cycle time.", _btc_regime_str, len(scan_symbols) - 1)
+                        # Set dashboard placeholder for skipped coins
+                        for remaining_sym in scan_symbols[1:]:
+                            if remaining_sym in config.EXCLUDED_COINS:
+                                continue
+                            self._coin_states[remaining_sym] = {
+                                "symbol": remaining_sym,
+                                "action": "FILTERED (MACRO VETO)",
+                                "regime": "N/A (Skipped)",
+                                "confidence": 0,
+                                "price": 0,
+                                "segment": get_segment_for_coin(remaining_sym),
+                            }
+                        break # Short-circuit the loop!
+
                 if result:
                     # ── Stamp segment onto every result at scan time ──────────
                     # This is the single source of truth for which segment a coin
@@ -871,32 +1112,37 @@ class RegimeMasterBot:
         #   4. Execute if Athena approves
         # No per-bot position cap — only the duplicate check prevents re-entering the same coin.
 
-        _tick_active_bots = list(config.ENGINE_ACTIVE_BOTS)
+        _SYSTEMATIC_BOT_PREFIXES = {"pyxis", "axiom", "ratio"}
+        # Only iterate HMM bots — systematic bots (Pyxis/Axiom/Ratio) are deployed
+        # by strategy_runner.py and must NOT go through the HMM waterfall loop.
+        _tick_active_bots = [
+            b for b in config.ENGINE_ACTIVE_BOTS
+            if b.get("bot_name", "").split()[0].lower() not in _SYSTEMATIC_BOT_PREFIXES
+        ]
 
 
         if not _tick_active_bots:
-            logger.warning("⚠️  No bots registered in ENGINE_ACTIVE_BOTS — skipping deploy step")
+            logger.warning("⚠️  No HMM bots registered (Titan/Vanguard/Rogue) — HMM deploy loop skipped")
 
         deployed_trades = []
         deployed = 0
         athena_calls_this_cycle = 0  # H4: track Athena calls to enforce LLM_MAX_CALLS_PER_CYCLE
-        # ── GUARD 4: Per-user Per-segment tick lock ──────────────────────────────
-        # Prevents the waterfall from cascading multiple DeFi coins for the SAME USER
-        # in the same cycle. If User A has 2 DeFi bots, they only deploy 1 DeFi coin
-        # per tick. Other users' bots are isolated and will also receive the deployment.
-        deployed_segments: set = set()  # set of (user_id, segment) tuples
-        deployed_user_coins: set = set() # track (user_id, sym) to prevent cross-bot duplication
+        
+        # ── Clear expired deploy locks (e.g. Binance API hung for > 15 seconds) ──
+        current_time = time.time()
+        self._deploying_locks = {k: v for k, v in self._deploying_locks.items() if current_time - v < 15.0}
 
         for target in _tick_active_bots:
             bot_id   = target.get("bot_id", config.ENGINE_BOT_ID)
             bot_name = target.get("bot_name", "Synaptic Bot")
             user_id  = target.get("user_id", config.ENGINE_USER_ID)
-            
-            raw_bot_segment = target.get("segment_filter", "ALL")
-            if not raw_bot_segment or raw_bot_segment == "ALL":
-                bot_segment_filter = _infer_segment_from_name(bot_name)
-            else:
-                bot_segment_filter = raw_bot_segment
+            bot_mode = target.get("mode", "paper").lower()   # ← per-bot mode from DB
+            bot_type = bot_name.split()[0] if bot_name else "BOT"
+            # NOTE: For bots named "Synaptic Titan" / "Synaptic Vanguard" / "Synaptic Rogue",
+            # split()[0] returns "Synaptic" for all — making bot_type non-unique.
+            # Use the FULL name for tier checks (done via bot_name_lower below) and
+            # use bot_id for duplicate guard to ensure each bot is independent.
+            # All bots trade ALL coins — segment routing removed (bots are strategy-based, not sector-based)
 
             # ── Clear stale deploy statuses from last cycle for this bot ──────────
             # Without this, coins that were #1 last cycle (e.g. RONIN with "Conviction too low")
@@ -905,172 +1151,112 @@ class RegimeMasterBot:
             for _cs in self._coin_states.values():
                 _cs.get("bot_deploy_statuses", {}).pop(bot_id, None)
 
-            # Build allowed-coin set for this bot's segment (including fallbacks if primary is blocked)
-            if bot_segment_filter == "ALL":
-                bot_allowed_coins = None  # no restriction
-                seg_results = list(raw_results)
-            else:
-                # ── SEGMENT FALLBACK LOGIC ──
-                # If primary segment is in cooldown, try the highest-ranked available segment
-                target_segment = bot_segment_filter
-                is_blocked, _ = self._is_segment_in_cooldown(target_segment, user_id)
-
-                if is_blocked:
-                    import json
-                    import os
-                    logger.info("🔄 [%s] Primary segment '%s' in cooldown, looking for fallback...", bot_name, target_segment)
-                    fallback_found = False
-                    
-                    # Read heatmap to get exact segment momentum rankings
-                    heatmap_path = os.path.join(config.DATA_DIR, "segment_heatmap.json")
-                    ranked_segments = []
-                    try:
-                        if os.path.exists(heatmap_path):
-                            with open(heatmap_path, "r") as f:
-                                heatmap_data = json.load(f)
-                                ranked_segments = [s["segment"] for s in sorted(heatmap_data.get("segments", []), key=lambda x: x["abs_score"], reverse=True)]
-                    except Exception as e:
-                        logger.error("Failed to parse heatmap for fallback routing: %s", e)
-
-                    if not ranked_segments:
-                        ranked_segments = list(config.CRYPTO_SEGMENTS.keys())
-
-                    for fallback_seg in ranked_segments:
-                        if fallback_seg == bot_segment_filter or fallback_seg == "ALL":
-                            continue
-                        f_blocked, _ = self._is_segment_in_cooldown(fallback_seg, user_id)
-                        if not f_blocked and (user_id, fallback_seg) not in deployed_segments:
-                            # ── Verify scanner provided coins for this fallback segment
-                            has_coins = any(r.get("segment", fallback_seg) == fallback_seg for r in raw_results if r["symbol"] in config.CRYPTO_SEGMENTS[fallback_seg])
-                            if has_coins:
-                                logger.info("✅ [%s] Found valid fallback target: '%s' (Highest ranked unblocked)", bot_name, fallback_seg)
-                                target_segment = fallback_seg
-                                fallback_found = True
-                                break
-                                
-                    if not fallback_found:
-                        logger.info("⏸️ [%s] Scanner capacity met (All available top segments claimed). Starving bot for this cycle.", bot_name)
-                        # Keep target_segment as original so it gracefully fails the cooldown gate below without crashing
-
-                bot_allowed_coins = set(config.CRYPTO_SEGMENTS.get(target_segment, []))
-                # Filter raw_results to this target segment
-                seg_results = [
-                    r for r in raw_results
-                    if r["symbol"] in bot_allowed_coins
-                    and r.get("segment", target_segment) == target_segment
-                ]
-                
-                # Update the bot's effective segment filter for this cycle so the rest of the loop uses the fallback
-                bot_segment_filter = target_segment
-
-
             # ── Waterfall: evaluate candidates in conviction order ─────────────────
-            # ATHENA_WATERFALL_DEPTH = how many coins per bot we'll send to Athena.
-            # If coin #1 is VETO'd → coin #2 gets evaluated, then #3, etc.
-            # One successful EXECUTE stops the waterfall for this bot.
+            # All bots receive the full ranked coin list — no sector restriction.
+            # Bot tier (STRICT/MODERATE/AGGRESSIVE) handles risk gates instead.
             waterfall_depth = getattr(config, "ATHENA_WATERFALL_DEPTH", 4)
-            waterfall_candidates = seg_results[:waterfall_depth]
+            waterfall_candidates = raw_results[:waterfall_depth]
 
             if not waterfall_candidates:
-                _all_syms = [r["symbol"] for r in raw_results]
-                _seg_mismatch = [
-                    f"{r['symbol']}({r.get('segment','?')})"
-                    for r in raw_results
-                    if r["symbol"] not in (bot_allowed_coins or set())
-                ][:5]
-                logger.info(
-                    "🔍 [%s] No HMM signals for segment '%s' this cycle | "
-                    "Total raw: %d | Segment mismatches (not shown): %s",
-                    bot_name, bot_segment_filter, len(_all_syms),
-                    _seg_mismatch or "none",
-                )
+                logger.info("🔍 [%s] No HMM signals this cycle | Total raw: %d",
+                            bot_name, len(raw_results))
                 continue
 
-            # Mark coins beyond the waterfall window as excluded (never evaluated)
-            for ignored in seg_results[waterfall_depth:]:
+            # Mark coins beyond the waterfall window as excluded
+            for ignored in raw_results[waterfall_depth:]:
                 sym = ignored["symbol"]
-                self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: Not top coin in segment"
+                self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: Outside waterfall depth"
 
             deploys_this_bot = 0  # counter: how many trades deployed this cycle for this bot
             max_deploys_bot = getattr(config, "MAX_DEPLOYS_PER_BOT_PER_CYCLE", 3)
 
-            # ── GUARD 4: Segment tick lock ────────────────────────────────────
-            # If this user's named segment was already served this cycle, skip the
-            # entire waterfall. This prevents 1 user's 10 bots all in "DeFi" from each
-            # deploying a different DeFi coin via the waterfall in the same tick.
-            if bot_segment_filter and (user_id, bot_segment_filter) in deployed_segments:
+            # ── Per-bot-per-user-per-mode trade cap ────────────────────────────
+            # Rule: each (user, bot) pair holds max 10 active trades per mode.
+            # Uses get_all_active_trades() (mode-agnostic) so bots registered as
+            # 'live' are counted even when the engine runs in paper mode.
+            # Filtering by user_id ensures each user has their own independent cap.
+            _MAX_BOT_TRADES = getattr(config, "MAX_USER_TRADES_PER_MODE", 10)
+            _bot_mode_count = sum(
+                1 for t in tradebook.get_all_active_trades()
+                if t.get("bot_id") == bot_id
+                and t.get("user_id") == user_id           # ← per-user isolation
+                and str(t.get("mode", "paper")).lower() == bot_mode
+            )
+            if _bot_mode_count >= _MAX_BOT_TRADES:
                 logger.info(
-                    "🔒 [%s] Segment '%s' already deployed this cycle for user %s — skip (Guard 4)",
-                    bot_name, bot_segment_filter, user_id
+                    "🚫 [%s] BOT_TRADE_CAP reached: %d/%d %s trades for bot %s user %s — skipping deploy",
+                    bot_name, _bot_mode_count, _MAX_BOT_TRADES, bot_mode.upper(), bot_id, user_id,
                 )
-                for _cs in self._coin_states.values():
-                    _cs.get("bot_deploy_statuses", {}).setdefault(bot_id, "FILTERED: segment already served this cycle")
-                # ── Signal Queue: queue top Athena-approved coin in this segment that got Guard-4-blocked ──
-                # We don't have Athena output yet (loop skipped), so queue the top HMM result
-                # for this bot's segment so it retries next cycle when the segment lock resets.
-                _seg_candidates = [r for r in raw_results if r.get("symbol") in (bot_allowed_coins or set())]
-                if not _seg_candidates and bot_allowed_coins is None:
-                    _seg_candidates = raw_results
-                if _seg_candidates:
-                    _top_blocked = _seg_candidates[0]
-                    _bsym = _top_blocked.get("symbol")
-                    if _bsym and _bsym not in self._pending_signals:
-                        self._pending_signals[_bsym] = {
-                            "result":         _top_blocked,
-                            "expires_at":     _now + self._SIGNAL_QUEUE_TTL_SECONDS,
-                            "queued_at":      _now,
-                            "cycles_pending": 1,
-                            "queue_reason":   "guard4_segment_locked",
-                        }
-                        logger.info("📥 Signal queue: queued %s (Guard 4 blocked segment %s)", _bsym, bot_segment_filter)
-                continue  # skip this bot entirely this cycle
+                for top in waterfall_candidates:
+                    self._coin_states.setdefault(top["symbol"], {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
+                        f"FILTERED: Bot {bot_mode.upper()} cap ({_bot_mode_count}/{_MAX_BOT_TRADES})"
+                    )
+                continue
+
+            # ── DCA Contagion Freeze Guard ────────────────────────────────────
+            # If the user has multiple trades actively demanding DCA rescue margin,
+            # freeze all NEW trade deployments to perfectly conserve capital.
+            dca_distress_count = sum(1 for pos in self._active_positions.values() 
+                                     if pos.get("user_id") == user_id and pos.get("dca_level", 1) > 1)
+            
+            if dca_distress_count >= getattr(config, "MAX_DCA_DISTRESS_TRADES", 2):
+                logger.warning("❄️ DCA CONTAGION FREEZE: User %s has %d trades in DCA Phase 2/3. Blocking [%s] from opening new positions.", user_id, dca_distress_count, bot_name)
+                for top in waterfall_candidates:
+                    self._coin_states.setdefault(top["symbol"], {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: DCA Contagion Freeze active"
+                continue  # Escapes bot processing, skipping new trades entirely
+
 
             for _wf_idx, top in enumerate(waterfall_candidates):
                 if deploys_this_bot >= max_deploys_bot:
                     break  # hit max deploys for this bot this cycle
 
                 sym      = top["symbol"]
-                pos_key  = _build_pos_key(bot_id, sym)
-                seg_name = top.get("segment") or get_segment_for_coin(sym)
+                
+                # ── BOT ROUTING GATE: Block systematic bots from the HMM waterfall ──
+                # HMM bots (Titan/Vanguard/Rogue) trade ANY coin in the scan pool —
+                # both narrative segments AND dynamic systematic universe coins.
+                # Systematic bots (Pyxis/Axiom/Ratio) are already excluded above
+                # via _SYSTEMATIC_BOT_PREFIXES before the outer loop.
+                # NOTE: Do NOT gate HMM bots on is_narrative_coin — the dynamic
+                # systematic universe (top-100 volume) contains many coins not in
+                # CRYPTO_SEGMENTS, and filtering them here silently blocks all
+                # waterfall candidates whenever the dynamic pool dominates.
+                # ───────────────────────────────────────────────────────────────────
 
-                # ── SEGMENT GUARD: hard-validate coin segment vs bot segment ──
-                # Even though seg_results was pre-filtered, reinjected or waterfall
-                # candidates could slip through if CRYPTO_SEGMENTS is stale.
-                # This is the final enforcement gate — mismatched coins are skipped.
-                if bot_segment_filter not in ("ALL", None):
-                    if seg_name != bot_segment_filter:
-                        logger.warning(
-                            "🚫 SEGMENT MISMATCH [%s]: coin=%s segment=%s bot_segment=%s — skipping",
-                            bot_name, sym, seg_name, bot_segment_filter
-                        )
-                        self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                            f"FILTERED: segment mismatch ({seg_name} ≠ {bot_segment_filter})"
-                        )
-                        continue
+                pos_key  = _build_pos_key(bot_id, sym, user_id)
+                seg_name = top.get("segment") or get_segment_for_coin(sym)  # for analytics / risk-manager only
 
-                # ── DUPLICATE GUARD: skip if this bot already has this coin active ──
-                if pos_key in self._active_positions:
+                # ── BOT-ID + USER-ID DUPLICATE GUARD ──────────────────────────────────
+                # Skip if THIS SPECIFIC USER's BOT already holds this coin.
+                # Keyed on (user_id, bot_id, symbol) so users are independent:
+                # User A's BTTCUSDT does NOT block User B's BTTCUSDT.
+                already_active = any(
+                    pos.get("user_id") == user_id and
+                    pos.get("bot_id") == bot_id and
+                    pos.get("symbol") == sym
+                    for pos in self._active_positions.values()
+                )
+
+                if already_active:
                     logger.debug(
-                        "⏭️  [%s] %s already active (pos_key=%s) — skip duplicate",
-                        bot_name, sym, pos_key
+                        "⏭️  [%s] %s already active for this bot type — skip duplicate",
+                        bot_name, sym
                     )
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
                         "FILTERED: already active position"
                     )
                     continue
 
-                # ── USER-LEVEL DUPLICATE GUARD: prevent cross-bot deployment for the same user ──
-                _user_has_coin_active = any(
-                    pos.get("user_id") == user_id and pos.get("symbol") == sym
-                    for pos in self._active_positions.values()
-                )
-                if _user_has_coin_active or (user_id, sym) in deployed_user_coins:
+                # ── GLOBAL DUPLICATE GUARD: cross-tick latency protection ──────────────────
+                # If Binance API lags, tradebook won't show the trade as ACTIVE yet.
+                # A rapid second tick will deploy it again unless we lock it in memory temporarily.
+                if (user_id, bot_id, sym) in self._deploying_locks:
                     logger.debug(
-                        "⏭️  [%s] User %s already has %s active (or queued this tick) — skip cross-bot duplicate",
-                        bot_name, user_id, sym
+                        "⏭️  [%s] System already deploying %s for user %s (waiting on API) — skip duplicate",
+                        bot_name, sym, user_id
                     )
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        "FILTERED: user already holds this coin in another bot"
+                        "FILTERED: API sync lock active"
                     )
                     continue
 
@@ -1078,86 +1264,229 @@ class RegimeMasterBot:
                     logger.info("⬇️  WATERFALL [%s] candidate #%d: %s (prev vetoed/skipped)",
                                 bot_name, _wf_idx + 1, sym)
 
-                # Conviction threshold — skip before Athena call if too low
+                # ── TIER EXTRACTOR: Route logic based on UI Setting ────────────────
+                bot_name_lower = bot_name.lower()
+                if "rogue" in bot_name_lower or "aggressive" in bot_name_lower:
+                    bot_tier = "AGGRESSIVE"
+                elif "vanguard" in bot_name_lower or "moderate" in bot_name_lower:
+                    bot_tier = "MODERATE"
+                else:
+                    bot_tier = "STRICT"
+                    
+                # Conviction threshold — dynamic per tier
                 conviction = top.get("conviction", 0)
                 hmm_confidence = top.get("confidence", 0)
+                tf_agreement = top.get("tf_agreement", 0)
                 
-                # ── NEW: HMM 80% Absolute Minimum ─────────────────────────────────
-                if hmm_confidence < 0.80:
-                    logger.info("⛔ [%s] %s HMM confidence %.2f < 0.80 — HMM VETO", bot_name, sym, hmm_confidence)
+                # ── NEW: Dynamic HMM Minimum ──────────────────────────────────────
+                if bot_tier == "AGGRESSIVE":
+                    hmm_threshold = 0.60
+                    req_conviction = 45 # Lower bound to let coins through
+                elif bot_tier == "MODERATE":
+                    hmm_threshold = 0.45 if tf_agreement >= 3 else 0.60
+                    req_conviction = 45 if tf_agreement >= 3 else 60
+                else:
+                    hmm_threshold = getattr(config, "MIN_CONVICTION_FOR_DEPLOY", 60) / 100.0
+                    req_conviction = getattr(config, "MIN_CONVICTION_FOR_DEPLOY", 60)
+                    
+                if hmm_confidence < hmm_threshold or conviction < req_conviction:
+                    logger.info("⛔ [%s] %s HMM conf %.2f/conv %.1f < req: %.2f/%.1f — HMM VETO", bot_name, sym, hmm_confidence, conviction, hmm_threshold, req_conviction)
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        f"FILTERED: HMM confidence < 80% ({hmm_confidence:.2f})"
+                        f"FILTERED: HMM confidence too low for tier ({hmm_confidence:.2f})"
                     )
                     continue
 
                 # ── NEW: BTC Chop/Sideways Global Veto ────────────────────────────
-                btc_regime = self._coin_states.get("BTCUSDT", {}).get("regime", "UNKNOWN")
-                if btc_regime in ("SIDEWAYS", "CHOP", "SIDEWAYS/CHOP", "UNKNOWN"):
-                    logger.info("⛔ [%s] %s BTC macro is %s — BTC CHOP VETO (no deployments allowed)", bot_name, sym, btc_regime)
-                    self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        f"FILTERED: BTC Macro is {btc_regime}"
-                    )
-                    continue
+                _btc_state = self._coin_states.get("BTCUSDT", {})
+                btc_regime_str = _btc_state.get("regime", "UNKNOWN")
+                _btc_regime_int = _btc_state.get("regime_int")  # set by _analyze_coin
+
+                _btc_is_chop = False
+                if _btc_regime_int is not None:
+                    _btc_is_chop = (_btc_regime_int == config.REGIME_CHOP)
+                else:
+                    if "4h=SIDEWAYS/CHOP" in btc_regime_str or "4h=CHOP" in btc_regime_str:
+                         _btc_is_chop = True
+                    elif btc_regime_str in ("SIDEWAYS", "CHOP", "SIDEWAYS/CHOP"):
+                         _btc_is_chop = True
+                    # NOTE: UNKNOWN is NOT treated as CHOP — engine startup produces
+                    # UNKNOWN before BTC has been analyzed. Treating it as chop would
+                    # block ALL STRICT tier trades for the first full analysis cycle.
+
+                if _btc_is_chop:
+                    if bot_tier in ("MODERATE", "AGGRESSIVE"):
+                        logger.info("✅ [%s] %s Bypassing BTC Macro Veto (Tier: %s)", bot_name, sym, bot_tier)
+                    else:
+                        logger.info("⛔ [%s] %s BTC macro is %s — BTC CHOP VETO (no deployments allowed)", bot_name, sym, btc_regime_str)
+                        self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
+                            f"FILTERED: BTC Macro is {btc_regime_str}"
+                        )
+                        try:
+                            get_svs().log_signal(
+                                symbol=sym, side=top.get("side", ""),
+                                signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                                segment=seg_name, conviction=conviction,
+                                hmm_conf=top.get("confidence", 0),
+                                entry_price=current_price,
+                                deployed=False, gate_vetoed="BTC_CHOP",
+                                cycle=self._cycle_count,
+                                rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                            )
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
+                            pass
+                        continue
 
                 # ── NEW: Momentum Alignment Veto ──────────────────────────────────
                 trade_side = top.get("side", "")
                 trend_dir = top.get("trend_direction", "UNKNOWN")
                 
-                if trade_side == "BUY" and trend_dir != "UP":
-                    logger.info("⛔ [%s] %s LONG against momentum (%s) — MOMENTUM VETO", bot_name, sym, trend_dir)
+                if bot_tier == "AGGRESSIVE":
+                    pass # Rogue completely ignores momentum
+                else:
+                    if trade_side == "BUY" and trend_dir == "DOWN":
+                        logger.info("⛔ [%s] %s LONG against momentum (%s) — MOMENTUM VETO", bot_name, sym, trend_dir)
+                        self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
+                            f"FILTERED: Momentum conflict (LONG in {trend_dir} trend)"
+                        )
+                        try:
+                            get_svs().log_signal(
+                                symbol=sym, side=top.get("side", ""),
+                                signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                                segment=seg_name, conviction=conviction,
+                                hmm_conf=top.get("confidence", 0),
+                                entry_price=current_price,
+                                deployed=False, gate_vetoed="MOMENTUM_VETO",
+                                cycle=self._cycle_count,
+                                rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                            )
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
+                            pass
+                        continue
+                    elif trade_side == "SELL" and trend_dir == "UP":
+                        logger.info("⛔ [%s] %s SHORT against momentum (%s) — MOMENTUM VETO", bot_name, sym, trend_dir)
+                        self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
+                            f"FILTERED: Momentum conflict (SHORT in {trend_dir} trend)"
+                        )
+                        try:
+                            get_svs().log_signal(
+                                symbol=sym, side=top.get("side", ""),
+                                signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                                segment=seg_name, conviction=conviction,
+                                hmm_conf=top.get("confidence", 0),
+                                entry_price=current_price,
+                                deployed=False, gate_vetoed="MOMENTUM_VETO",
+                                cycle=self._cycle_count,
+                                rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                            )
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
+                            pass
+                        continue
+                # ── NEW: RSI Overextension Gate ───────────────────────────────
+                # Prevent entries when 1h RSI is extreme (buying into overbought,
+                # selling into oversold). At 10x leverage these are very high-risk entries.
+                _rsi_gate = self._coin_states.get(sym, {}).get("rsi_1h", 50.0)
+                if trade_side == "BUY"  and _rsi_gate > 73.0:
+                    logger.info("⛔ [%s] %s RSI %.1f > 73 (overbought) — RSI GATE skip",
+                                bot_name, sym, _rsi_gate)
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        f"FILTERED: Momentum conflict (LONG in {trend_dir} trend)"
+                        f"FILTERED: RSI overextended LONG ({_rsi_gate:.0f})"
                     )
+                    try:
+                        get_svs().log_signal(
+                            symbol=sym, side=top.get("side", ""),
+                            signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                            segment=seg_name, conviction=conviction,
+                            hmm_conf=top.get("confidence", 0),
+                            entry_price=current_price,
+                            deployed=False, gate_vetoed="RSI_EXTENDED",
+                            cycle=self._cycle_count,
+                            rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                        )
+                    except Exception as e:
+                        try:
+                            logger.debug('Exception caught: %s', e, exc_info=True)
+                        except NameError:
+                            pass
+                        pass
                     continue
-                elif trade_side == "SELL" and trend_dir != "DOWN":
-                    logger.info("⛔ [%s] %s SHORT against momentum (%s) — MOMENTUM VETO", bot_name, sym, trend_dir)
+                if trade_side == "SELL" and _rsi_gate < 27.0:
+                    logger.info("⛔ [%s] %s RSI %.1f < 27 (oversold) — RSI GATE skip",
+                                bot_name, sym, _rsi_gate)
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        f"FILTERED: Momentum conflict (SHORT in {trend_dir} trend)"
+                        f"FILTERED: RSI overextended SHORT ({_rsi_gate:.0f})"
                     )
+                    try:
+                        get_svs().log_signal(
+                            symbol=sym, side=top.get("side", ""),
+                            signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                            segment=seg_name, conviction=conviction,
+                            hmm_conf=top.get("confidence", 0),
+                            entry_price=current_price,
+                            deployed=False, gate_vetoed="RSI_EXTENDED",
+                            cycle=self._cycle_count,
+                            rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                        )
+                    except Exception as e:
+                        try:
+                            logger.debug('Exception caught: %s', e, exc_info=True)
+                        except NameError:
+                            pass
+                        pass
                     continue
-
 
 
                 min_conv   = getattr(config, "MIN_CONVICTION_FOR_DEPLOY", 60)
                 if conviction < min_conv:
                     logger.info("⛔ [%s] %s conviction %.0f < %.0f — waterfall exhausted (remaining candidates also low)",
                                  bot_name, sym, conviction, min_conv)
-                    # All remaining candidates will also fail — break out
-                    break
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
                         f"FILTERED: low conviction ({conviction:.0f} < {min_conv:.0f})"
                     )
+                    try:
+                        get_svs().log_signal(
+                            symbol=sym, side=top.get("side", ""),
+                            signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                            segment=seg_name, conviction=conviction,
+                            hmm_conf=top.get("confidence", 0),
+                            entry_price=current_price,
+                            deployed=False, gate_vetoed="LOW_CONVICTION",
+                            cycle=self._cycle_count,
+                            rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                        )
+                    except Exception as e:
+                        try:
+                            logger.debug('Exception caught: %s', e, exc_info=True)
+                        except NameError:
+                            pass
+                        pass
                     continue
+                    # All remaining candidates will also fail — break out
+                    break
 
                 # ── C4 Fix: Enforce MAX_OPEN_TRADES cap ──────────────────────────
-                max_trades = getattr(config, "MAX_OPEN_TRADES", 25)
-                if tradebook_active_count + deployed >= max_trades:
-                    logger.warning(
-                        "🛑 MAX_OPEN_TRADES cap reached (%d open + %d this tick = %d >= limit %d) — "
-                        "skipping [%s] %s", tradebook_active_count, deployed,
-                        tradebook_active_count + deployed, max_trades, bot_name, sym
-                    )
-                    self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
-                        f"FILTERED: max open trades cap ({max_trades}) reached"
-                    )
-                    continue
+                # MAX_OPEN_TRADES cap removed to allow unlimited multi-bot deployment velocity
 
                 if self.risk.check_kill_switch():
                     return
 
                 # ── Conviction-based leverage ─────────────────────────────────────
-                # H2 Fix: 4-tier scale — borderline signals (65–69) get reduced leverage
-                if conviction >= 95:
-                    lev, fallback_lev = 25, 10
-                elif conviction >= 80:
-                    lev, fallback_lev = 20, 10
-                elif conviction >= 70:
-                    lev, fallback_lev = 15, 5
-                else:
-                    lev, fallback_lev = 10, 5
+                # Flat 10x across all conviction tiers (user setting)
+                lev, fallback_lev = 10, 5
 
                 # ── Segment Cooldown Gate: block entire segment under cooldown ────────
-                _seg_blocked, _seg_reason = self._is_segment_in_cooldown(seg_name, user_id)
+                _seg_blocked, _seg_reason = self.risk_manager.is_segment_in_cooldown(seg_name, user_id)
                 if _seg_blocked:
                     logger.info("🔒 SEGMENT_COOLDOWN [%s] seg=%s %s — skipping deploy for [%s]",
                                 sym, seg_name, _seg_reason, bot_name)
@@ -1168,7 +1497,7 @@ class RegimeMasterBot:
                     continue
 
                 # ── Cooldown Gate: block redeployment per 5-rule policy ───────────────
-                _cd_blocked, _cd_reason = self._is_in_cooldown(sym)
+                _cd_blocked, _cd_reason = self.risk_manager.is_in_cooldown(sym)
                 if _cd_blocked:
                     logger.info("⏳ COOLDOWN [%s] %s — skipping deploy for [%s]", sym, _cd_reason, bot_name)
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = (
@@ -1208,11 +1537,11 @@ class RegimeMasterBot:
                         # Low-β coins (≤0.50): trade on own signal, BTC less relevant.
                         _btc_correlation = None
                         try:
-                            from data_pipeline import fetch_klines as _fk
+
                             _c_df  = _fk(sym,      "1h", 100)
                             _b_df  = _fk("BTCUSDT", "1h", 100)
                             if _c_df is not None and _b_df is not None and len(_c_df) >= 20 and len(_b_df) >= 20:
-                                import numpy as _np
+
                                 _c_ret = _c_df["close"].pct_change().dropna()
                                 _b_ret = _b_df["close"].pct_change().dropna()
                                 _n = min(len(_c_ret), len(_b_ret))
@@ -1220,7 +1549,11 @@ class RegimeMasterBot:
                                     _c_ret.iloc[-_n:].values,
                                     _b_ret.iloc[-_n:].values
                                 )[0, 1]), 3)
-                        except Exception:
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
                             pass  # Non-fatal — Athena will see N/A
 
                         llm_ctx = {
@@ -1253,6 +1586,10 @@ class RegimeMasterBot:
                             "nearest_bearish_ob": top.get("nearest_bearish_ob"),  # supply zone
                             "nearest_bid_wall":   top.get("nearest_bid_wall"),    # bid wall price
                             "nearest_ask_wall":   top.get("nearest_ask_wall"),    # ask wall price
+                            # ── Community intelligence (AI4Trade) ────────
+                            "community_context":  self._ai4trade.get_community_context(sym) if self._ai4trade else "",
+                            # ── Loss streak for Athena drawdown guardrail (Rule 13) ──
+                            "loss_streak": tradebook.get_current_loss_streak()[0],
                         }
                         athena_decision = self._athena.validate_signal(llm_ctx)
                         # Only count REAL Gemini API calls — cached decisions are free.
@@ -1276,6 +1613,20 @@ class RegimeMasterBot:
                         logger.info("🏛️ ATHENA [%s] %s → %s (conf=%.0f%%)",
                                     bot_name, sym, athena_decision.action,
                                     athena_decision.adjusted_confidence * 100)
+                        
+                        # ── Intelligence Log: record EVERY decision for the Dashboard ──
+                        self._veto_log.append({
+                            "symbol":     sym,
+                            "price":      current_price,
+                            "side":       top.get("side", ""),
+                            "conviction": top.get("conviction", 0),
+                            "reason":     (athena_decision.reasoning or "")[:200],
+                            "action":     athena_decision.action,
+                            "ts":         _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        })
+                        if len(self._veto_log) > self._VETO_LOG_MAX:
+                            self._veto_log = self._veto_log[-self._VETO_LOG_MAX:]
+                            
                     except Exception as e:
                         logger.warning("⚠️ Athena call failed for %s: %s — failing open (deploy anyway)", sym, e)
                         athena_decision = None  # fail open: treat as EXECUTE
@@ -1287,19 +1638,6 @@ class RegimeMasterBot:
                     _bcast("ATHENA_VETO", self._cycle_count, bot_name, bot_id, sym,
                            top["side"], seg_name, top.get("confidence", 0),
                            f"Athena vetoed: {athena_decision.action} — {athena_decision.reasoning[:80]}")
-                    # ── Veto Log: record for retrospective analysis ─────────────────────────
-                    import datetime as _dt
-                    self._veto_log.append({
-                        "symbol":     sym,
-                        "price":      current_price,
-                        "side":       top.get("side", ""),
-                        "conviction": top.get("conviction", 0),
-                        "reason":     (athena_decision.reasoning or "")[:200],
-                        "action":     athena_decision.action,
-                        "ts":         _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    })
-                    if len(self._veto_log) > self._VETO_LOG_MAX:
-                        self._veto_log = self._veto_log[-self._VETO_LOG_MAX:]
                     # ── Athena Decision Log (persistent JSONL) ─────────────────────────
                     _log_athena_decision(
                         cycle=self._cycle_count, symbol=sym, segment=seg_name,
@@ -1318,7 +1656,7 @@ class RegimeMasterBot:
                         del self._pending_signals[sym]
                     # ── Telegram VETO alert ────────────────────────────────────────
                     try:
-                        import telegram as _tg
+
                         _tg.notify_athena_veto(
                             sym=sym,
                             side=top.get("side", ""),
@@ -1367,7 +1705,7 @@ class RegimeMasterBot:
                             "suggested_tp": getattr(athena_decision, "suggested_tp", 0),
                         }
                         try:
-                            import telegram as _tg
+
                             _tg.notify_athena_veto(
                                 sym=sym,
                                 side=trade_side,
@@ -1375,35 +1713,26 @@ class RegimeMasterBot:
                                 reasoning=f"BTC MACRO VETO: {_direction} blocked — BTC is {btc_regime}, needs ≥{btc_counter_threshold*100:.0f}%",
                                 segment=seg_name,
                             )
-                        except Exception:
+                        except Exception as e:
+                            try:
+                                logger.debug('Exception caught: %s', e, exc_info=True)
+                            except NameError:
+                                pass
                             pass
                         continue
+
+                # Use the HMM signal direction directly
+                effective_side = top.get("side", "")
 
                 # ── Athena EXECUTE: fire Telegram signal alert ────────────────────
                 # SL/TP from Athena suggested values (will be refined during deploy)
                 _a_sl = getattr(athena_decision, "suggested_sl", 0) or 0
                 _a_tp = getattr(athena_decision, "suggested_tp", 0) or 0
-                try:
-                    import telegram as _tg
-                    _tg.notify_athena_signal(
-                        sym=sym,
-                        side=top.get("side", ""),
-                        conviction_pct=athena_decision.adjusted_confidence * 100,
-                        entry_price=current_price,
-                        sl=_a_sl,
-                        tp=_a_tp,
-                        segment=seg_name,
-                        reasoning=athena_decision.reasoning or "",
-                        bot_name=bot_name,
-                        leverage=lev,
-                    )
-                except Exception as _tg_err:
-                    logger.warning("⚠️ Athena EXECUTE telegram failed: %s", _tg_err)
 
                 # ── Athena Decision Log (EXECUTE) ─────────────────────────────────
                 _log_athena_decision(
                     cycle=self._cycle_count, symbol=sym, segment=seg_name,
-                    side=top.get("side", ""), decision="EXECUTE",
+                    side=effective_side, decision="EXECUTE",
                     conviction=athena_decision.adjusted_confidence if athena_decision else top.get("conviction", 0),
                     price=current_price,
                     sl=_a_sl, tp=_a_tp,
@@ -1411,8 +1740,19 @@ class RegimeMasterBot:
                 )
 
                 # ── Build trade dict ──────────────────────────────────────────────
-                capital     = target.get("capital_per_trade") or getattr(config, "CAPITAL_PER_TRADE", 100.0)
-                qty         = (capital * lev) / max(current_price, 0.0001)
+                # Base capital allocated per trade: 2% of total exchange wallet balance.
+                # Replaces static CAPITAL_PER_TRADE to ensure compounding & risk parity.
+                base_capital = balance * 0.02
+                if base_capital <= 0:
+                    base_capital = target.get("capital_per_trade") or getattr(config, "CAPITAL_PER_TRADE", 100.0)
+                
+                # Conviction-weighted sizing (+25% for high conviction, -25% for low)
+                if conviction >= 80:
+                    target_capital = base_capital * 1.25
+                elif conviction >= 60:
+                    target_capital = base_capital
+                else:
+                    target_capital = base_capital * 0.75
                 
                 # Base math reason
                 reason_str  = top.get("reason", f"{top.get('regime_name','')} {int(top['confidence']*100)}%")
@@ -1422,24 +1762,69 @@ class RegimeMasterBot:
                 if athena_decision and not athena_decision.reasoning.startswith("Auto-approve"):
                     reason_str = f"Athena ✅ ({int(athena_decision.adjusted_confidence*100)}%): {athena_decision.reasoning[:200]}"
                     final_conf = athena_decision.adjusted_confidence
+                    
+                    # Natively dynamically slash margin capital based on Athena's institutional grading
+                    target_capital = target_capital * athena_decision.adjusted_confidence
+                    
+                    if hasattr(athena_decision, "recommended_leverage") and athena_decision.recommended_leverage > 0:
+                        lev = athena_decision.recommended_leverage
+
+                # DCA: Phase-1 capital for position sizing; record full base_capital for dashboard
+                dca_phases = getattr(config, "DCA_PHASES", [{"alloc_pct": 1.0}])
+                phase_1_capital = target_capital * dca_phases[0]["alloc_pct"]
+                
+                # Apply fixed leverage override (config.FIXED_LEVERAGE overrides HMM/Athena)
+                _fixed_lev = getattr(config, "FIXED_LEVERAGE", None)
+                if _fixed_lev:
+                    lev = _fixed_lev
+                qty         = (phase_1_capital * lev) / max(current_price, 0.0001)
+                # Record the full intended budget (not the DCA slice) so the dashboard
+                # shows $100/trade as configured, not $34 (30% of conviction-adjusted capital)
+                recorded_capital = base_capital
+
+                # ── Pre-initialize fill_sl/fill_tp from Athena before execute_trade ──
+                # fill_sl/fill_tp are passed INTO execute_trade() as hints (paper mode uses them
+                # directly). They will be overwritten by the actual exchange fill values after
+                # the call completes. Without this initialization, any paper-mode path that
+                # doesn't assign them first causes an UnboundLocalError on line 1793.
+                fill_sl = _a_sl  # Athena suggested SL (0.0 if not provided)
+                fill_tp = _a_tp  # Athena suggested TP (0.0 if not provided)
 
                 # SIGNAL_DISPATCH broadcast
                 _bcast("SIGNAL_DISPATCH", self._cycle_count, bot_name, bot_id, sym,
-                       top["side"], seg_name, final_conf,
+                       effective_side, seg_name, final_conf,
                        f"regime={top.get('regime_name','')} lev={lev}x qty={qty:.4f} athena=APPROVED")
 
                 self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "DEPLOY_QUEUED"
+                # SVS: log successful deploy for forward accuracy measurement
+                try:
+                    get_svs().log_signal(
+                        symbol=sym, side=effective_side,
+                        signal_type=top.get("signal_type", "TREND_FOLLOW"),
+                        segment=seg_name, conviction=conviction,
+                        hmm_conf=top.get("confidence", 0),
+                        entry_price=current_price,
+                        deployed=True, gate_vetoed="DEPLOYED",
+                        cycle=self._cycle_count,
+                        rsi_1h=self._coin_states.get(sym, {}).get("rsi_1h", 50.0),
+                    )
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
+                    pass
 
                 logger.info(
                     "🔥 DEPLOYING [%s]: %s %s @ %dx | HMM %.0f%% conv | Athena ✅ %.0f%%",
-                    bot_name, top["side"], sym, lev, conviction, final_conf * 100,
+                    bot_name, effective_side, sym, lev, conviction, final_conf * 100,
                 )
 
                 # Execute
                 try:
                     result = self.executor.execute_trade(
                         symbol=sym,
-                        side=top["side"],
+                        side=effective_side,
                         leverage=lev,
                         quantity=qty,
                         atr=atr_val,
@@ -1449,11 +1834,14 @@ class RegimeMasterBot:
                         swing_l=top.get("swing_l"),
                         swing_h=top.get("swing_h"),
                         fallback_leverage=fallback_lev,
+                        stop_loss=fill_sl,
+                        take_profit=fill_tp,
+                        paper_override=(bot_mode == "paper"),  # ← per-bot paper/live override
                     )
                 except Exception as exec_err:
                     logger.error("🚨 EXECUTE CRASH [%s] %s: %s", bot_name, sym, exec_err, exc_info=True)
                     _bcast("EXEC_CRASH", self._cycle_count, bot_name, bot_id, sym,
-                           top["side"], seg_name, top["confidence"],
+                           effective_side, seg_name, top["confidence"],
                            f"{type(exec_err).__name__}: {str(exec_err)[:120]}")
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: execute crash"
                     continue
@@ -1461,7 +1849,7 @@ class RegimeMasterBot:
                 if result is None and not config.PAPER_TRADE:
                     logger.warning("⚠️ EXEC RETURNED NONE [%s] %s — order rejected", bot_name, sym)
                     _bcast("EXEC_NULL", self._cycle_count, bot_name, bot_id, sym,
-                           top["side"], seg_name, top["confidence"],
+                           effective_side, seg_name, top["confidence"],
                            "execute_trade returned None (live mode) — order rejected")
                     self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: exec returned None"
                     continue
@@ -1469,7 +1857,7 @@ class RegimeMasterBot:
                 entry_price  = result.get("entry_price", 0) if result else 0
                 fill_qty     = result.get("quantity",   qty)    if result else qty
                 fill_lev     = result.get("leverage",   lev)    if result else lev
-                fill_capital = result.get("capital",    capital) if result else capital
+                fill_capital = base_capital  # full $100 per trade (DCA paused — do not use phase_1_capital)
                 fill_sl      = result.get("stop_loss",  0)      if result else 0
                 fill_tp      = result.get("take_profit", 0)     if result else 0
 
@@ -1481,35 +1869,40 @@ class RegimeMasterBot:
                 if athena_decision and entry_price > 0:
                     a_sl = getattr(athena_decision, 'suggested_sl', 0) or 0
                     a_tp = getattr(athena_decision, 'suggested_tp', 0) or 0
-                    is_long = top["side"].upper() in ("BUY", "LONG")
 
-                    # Sanity check: SL must be on correct side and within 20% of entry
+                    is_long = effective_side.upper() in ("BUY", "LONG")
+
+                    # Sanity check: SL must be on correct side and within leverage-aware max-loss cap
+                    # FIX: 30% was dangerously wide at 10x (= 300% margin loss). Cap at MAX_LOSS/leverage.
+                    _max_sl_dist = abs(getattr(config, 'MAX_LOSS_PER_TRADE_PCT', 20)) / (fill_lev * 100)  # e.g. 20/(10*100)=2%
+                    _max_sl_dist = max(_max_sl_dist, 0.005)  # floor at 0.5% to avoid rejecting all SLs
                     if a_sl > 0:
                         sl_dist_pct = abs(a_sl - entry_price) / entry_price
                         sl_correct_side = (is_long and a_sl < entry_price) or (not is_long and a_sl > entry_price)
-                        if sl_correct_side and sl_dist_pct < 0.20:
+                        if sl_correct_side and sl_dist_pct < _max_sl_dist:
                             fill_sl = a_sl
                             athena_sl_used = True
                         else:
-                            logger.debug("🏛️ Athena SL rejected for %s: sl=%.4f entry=%.4f side=%s",
-                                         sym, a_sl, entry_price, top["side"])
+                            logger.debug("🏛️ Athena SL rejected for %s: sl=%.4f entry=%.4f dist=%.2f%% max=%.2f%%",
+                                         sym, a_sl, entry_price, sl_dist_pct * 100, _max_sl_dist * 100)
 
-                    # Sanity check: TP must be on correct side and within 30% of entry
+                    # Sanity check: TP must be on correct side and within 25% of entry (tightened from 40%)
                     if a_tp > 0:
                         tp_dist_pct = abs(a_tp - entry_price) / entry_price
                         tp_correct_side = (is_long and a_tp > entry_price) or (not is_long and a_tp < entry_price)
-                        if tp_correct_side and tp_dist_pct < 0.30:
+                        if tp_correct_side and tp_dist_pct < 0.25:
                             fill_tp = a_tp
                             athena_tp_used = True
                         else:
                             logger.debug("🏛️ Athena TP rejected for %s: tp=%.4f entry=%.4f side=%s",
-                                         sym, a_tp, entry_price, top["side"])
+                                         sym, a_tp, entry_price, effective_side)
 
                     if athena_sl_used or athena_tp_used:
                         logger.info("🏛️ Athena SL/TP override [%s]: SL=%s(%.4f) TP=%s(%.4f)",
                                     sym,
                                     "ATHENA" if athena_sl_used else "ATR", fill_sl,
-                                    "ATHENA" if athena_tp_used else "ATR", fill_tp)
+                                    "ATHENA" if athena_tp_used else "ATR", fill_tp,
+                                    )
 
                 # H5 Fix: validate entry_price in ALL modes, not just live
                 if entry_price <= 0:
@@ -1519,7 +1912,7 @@ class RegimeMasterBot:
                         logger.warning("⚠️ PAPER zero entry_price for %s — using current_price %.6f", sym, entry_price)
                     else:
                         _bcast("EXEC_ZERO_PRICE", self._cycle_count, bot_name, bot_id, sym,
-                               top["side"], seg_name, top["confidence"], "entry_price=0")
+                               effective_side, seg_name, top["confidence"], "entry_price=0")
                         self._coin_states.setdefault(sym, {}).setdefault("bot_deploy_statuses", {})[bot_id] = "FILTERED: zero entry price"
                         continue
 
@@ -1531,7 +1924,7 @@ class RegimeMasterBot:
                 # the stored trade, so non-admin bots would open new trades every cycle.
                 tradebook.open_trade(
                     symbol=sym,
-                    side=top["side"],
+                    side=effective_side,
                     leverage=fill_lev,
                     quantity=fill_qty,
                     entry_price=entry_price,
@@ -1539,7 +1932,9 @@ class RegimeMasterBot:
                     regime=top.get("regime_name", ""),
                     confidence=top["confidence"],
                     reason=reason_str,
-                    capital=fill_capital,
+                    capital=fill_capital,          # This is the Phase 1 deployed capital
+                    target_capital=target_capital, # Handover Total intend capital to DCA tracker
+                    mode=bot_mode,                 # ← per-bot mode (paper/live) from DB, not global flag
                     user_id=user_id,
                     profile_id="segment",
                     bot_name=bot_name,
@@ -1555,26 +1950,42 @@ class RegimeMasterBot:
                 )
 
                 _bcast("TRADEBOOK_RECORDED", self._cycle_count, bot_name, bot_id, sym,
-                       top["side"], seg_name, top["confidence"],
+                       effective_side, seg_name, top["confidence"],
                        f"entry=${entry_price:.4f} lev={fill_lev}x sl=${fill_sl:.4f} tp=${fill_tp:.4f}")
+
+                # ── AI4Trade: Publish Trade Signal ────────────────────
+                if self._ai4trade and getattr(config, "AI4TRADE_ENABLED", False):
+                    min_conv = getattr(config, "AI4TRADE_MIN_CONVICTION", 70.0)
+                    if top["confidence"] >= min_conv:
+                        try:
+                            self._ai4trade.publish_trade_open(
+                                symbol=sym,
+                                side=effective_side,
+                                entry_price=entry_price,
+                                quantity=fill_qty,
+                                conviction=top["confidence"],
+                                regime=top.get("regime_name", "UNKNOWN"),
+                                reasoning=reason_str,
+                                entry_timestamp=datetime.now(timezone.utc).isoformat(),
+                            )
+                        except Exception as e:
+                            logger.debug("AI4Trade publish failed: %s", e)
 
                 self._active_positions[pos_key] = {
                     "user_id":  user_id,
                     "bot_name": bot_name,
                     "regime":   top.get("regime_name", ""),
                     "confidence": top["confidence"],
-                    "side":     top["side"],
+                    "side":     effective_side,
                     "entry_time": datetime.now(IST).replace(tzinfo=None).isoformat(),
                     "leverage": fill_lev,
                     "entry_price": entry_price,
                     "quantity": fill_qty,
+                    "symbol": sym,
                 }
-                # Guard 4: lock this segment for the rest of the cycle for THIS USER
-                if bot_segment_filter:
-                    deployed_segments.add((user_id, bot_segment_filter))
-                deployed_user_coins.add((user_id, sym))
+                self._deploying_locks[(user_id, bot_id, sym)] = time.time()
                 # ── Segment Cooldown: track deployment for churn detection (Rule 4) ──
-                self._record_segment_open(seg_name, user_id)
+                self.risk_manager.record_segment_open(seg_name, user_id)
                 # Signal Queue: step 4 — dequeue successfully deployed coin
                 if sym in self._pending_signals:
                     logger.info("✅ Signal queue: dequeuing %s (deployed after %d cycle(s) pending)",
@@ -1593,7 +2004,7 @@ class RegimeMasterBot:
                     "take_profit": fill_tp,
                     "profile": "segment", # fixed
                     "symbol": sym, # Add symbol for batch notification filtering
-                    "side": top["side"], # Add side for batch notification
+                    "side": effective_side,
                 })
 
                 deploys_this_bot += 1  # waterfall: continues until max_deploys_bot reached
@@ -1607,13 +2018,17 @@ class RegimeMasterBot:
                 full_records = [t for t in active if t["symbol"] in deployed_syms]
                 # Use full records if available (has SL/TP), else use collected data
                 tg.notify_batch_entries(full_records if full_records else deployed_trades)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 pass
 
         # ── 6. Save state for dashboard ──────────────────────────
         cycle_duration = time.time() - cycle_start
         self._last_cycle_duration = cycle_duration
-        self._save_multi_state(symbols, deployed_trades, deployed)
+        self.state_manager.save_multi_state(symbols, deployed_trades, deployed)
 
         # ── 7. Persist cycle snapshot to DB (background thread, non-blocking) ─
         threading.Thread(
@@ -1629,6 +2044,38 @@ class RegimeMasterBot:
             len(tradebook.get_active_trades()),
         )
 
+        # ── 8. AI4Trade: Publish Strategy Summary ─────────────────────
+        if self._ai4trade and getattr(config, "AI4TRADE_POST_STRATEGY", False):
+            cycle_n = getattr(config, "AI4TRADE_STRATEGY_EVERY_N", 5)
+            if self._cycle_count % cycle_n == 0:
+                top_coin = self._coin_states.get(config.PRIMARY_SYMBOL, {})
+                btc_reg = self._coin_states.get("BTCUSDT", {}).get("regime", "UNKNOWN")
+                try:
+                    self._ai4trade.publish_cycle_strategy(
+                        cycle=self._cycle_count,
+                        btc_regime=btc_reg,
+                        top_coin=config.PRIMARY_SYMBOL.replace("USDT", ""),
+                        top_side=top_coin.get("action", "SCAN"),
+                        top_conviction=top_coin.get("confidence", 0.0),
+                        n_deployed=deployed
+                    )
+                except Exception as e:
+                    logger.debug("AI4Trade strategy post failed: %s", e)
+
+        # ── 9. Flush batched Telegram notifications ────────────────────
+        try:
+            tg.flush_trade_closes()
+        except Exception as e:
+            logger.debug("Telegram close flush failed: %s", e)
+        try:
+            tg.flush_veto_batch()
+        except Exception as e:
+            logger.debug("Telegram veto flush failed: %s", e)
+        try:
+            tg.flush_max_loss_batch()
+        except Exception as e:
+            logger.debug("Telegram max-loss flush failed: %s", e)
+
     def _post_cycle_snapshot(self, cycle_duration: float, deployed_trades: list, deployed: int):
         """POST per-cycle signal archive to dashboard /api/cycle-snapshot for DB persistence."""
         try:
@@ -1636,7 +2083,7 @@ class RegimeMasterBot:
             if not dashboard_url:
                 return  # no dashboard URL configured — silent skip
 
-            secret = os.environ.get("ENGINE_INTERNAL_SECRET", "synaptic-internal-2024")
+            secret = os.environ.get("ENGINE_INTERNAL_SECRET", "")
 
             # Collect per-coin scan results from _coin_states
             coin_results = []
@@ -1660,36 +2107,6 @@ class RegimeMasterBot:
                     "athena_decision": state.get("athena_decision"),
                 })
 
-            # Collect segment heatmap data
-            heatmap = {}
-            try:
-                heatmap_file = getattr(config, "HEATMAP_STATE_FILE", "data/segment_heatmap.json")
-                if os.path.exists(heatmap_file):
-                    with open(heatmap_file, "r") as f:
-                        hmap = json.load(f)
-                    segs = hmap.get("segments", [])
-                    btc_24h = hmap.get("btc_24h", 0)
-                    selected = {s.get("segment") for s in segs[:2]}  # top-2 are selected
-                    
-                    segments_list = []
-                    for i, seg in enumerate(segs):
-                        segments_list.append({
-                            "segment":         seg.get("segment"),
-                            "composite_score": seg.get("composite_score"),
-                            "vw_rr":           seg.get("vw_rr"),
-                            "btc_alpha":       seg.get("btc_alpha"),
-                            "breadth_pct":     seg.get("breadth_pct"),
-                            "is_selected":     seg.get("segment") in selected,
-                            "rank":            i + 1,
-                        })
-                    
-                    heatmap = {
-                        "segments": segments_list,
-                        "btc_24h": btc_24h
-                    }
-            except Exception:
-                pass
-
             # BTC state for market context
             btc_state = self._coin_states.get("BTCUSDT", {})
             active_bots = list(config.ENGINE_ACTIVE_BOTS)
@@ -1711,7 +2128,6 @@ class RegimeMasterBot:
                 "deployed_count": deployed,
                 "filtered_count": max(0, len(self._coin_states) - len(deployed_trades)),
                 "coin_results":   coin_results,
-                "heatmap":        heatmap,
             }
 
             data = json.dumps(payload).encode("utf-8")
@@ -2357,17 +2773,23 @@ class RegimeMasterBot:
                 del self._active_positions[key]
 
     def _load_positions_from_tradebook(self):
-        """Load active tradebook entries into _active_positions on startup."""
+        """Load active tradebook entries into _active_positions on startup.
+
+        Uses get_all_active_trades() (mode-agnostic) so trades from bots
+        registered as 'live' are visible even when the engine starts in
+        paper mode, ensuring the duplicate guard works for all users.
+        """
         try:
-            active_trades = tradebook.get_active_trades()
+            active_trades = tradebook.get_all_active_trades()  # mode-agnostic: sees all users
             for t in active_trades:
-                sym = t["symbol"]
-                bot_id = t.get("bot_id", "")
+                sym     = t["symbol"]
+                bot_id  = t.get("bot_id", "")
                 user_id = t.get("user_id", getattr(config, "ENGINE_USER_ID", "default"))
-                pos_key = _build_pos_key(bot_id, sym)
+                pos_key = _build_pos_key(bot_id, sym, user_id)  # includes user_id
                 if pos_key not in self._active_positions:
                     self._active_positions[pos_key] = {
                         "user_id": user_id,
+                        "bot_id":  bot_id,
                         "regime": t.get("regime", "UNKNOWN"),
                         "confidence": t.get("confidence", 0),
                         "side": t.get("side", "BUY"),
@@ -2385,264 +2807,21 @@ class RegimeMasterBot:
             logger.warning("Could not load tradebook positions on startup: %s", e)
 
 
-    # ── Coin Cooldown Methods ──────────────────────────────────────────────────
-
-    def _apply_cooldown(self, sym: str, trade: dict) -> None:
-        """Evaluate all 5 cooldown rules for a just-closed trade and set expiry.
-
-        Rules (in priority order — highest duration wins):
-          1. SL/Trailing-SL/MAX_LOSS exit      → 90 min
-          2. Any loss close (non-SL)           → 45 min
-          3. Flash close  (loss + held < 15m)  → 120 min (overrides rule 1&2)
-          4. Same-direction repeat             → 30 min (additive if no harder rule)
-          5. Daily cap (≥ 3 closes in 24h)    → until UTC midnight
-        """
-        if not getattr(config, "COOLDOWN_ENABLED", True):
-            return
-
-        now = datetime.utcnow()
-        exit_reason   = (trade.get("exit_reason") or "").upper()
-        realized_pnl  = float(trade.get("realized_pnl_pct") or trade.get("pnl_pct") or 0)
-        side          = (trade.get("position") or trade.get("side") or "").upper()
-
-        # Hold time in minutes
-        opened_at = trade.get("entry_time") or trade.get("created_at") or trade.get("open_time")
-        hold_mins = 9999
-        if opened_at:
-            try:
-                if isinstance(opened_at, str):
-                    from dateutil import parser as _dp
-                    opened_dt = _dp.parse(opened_at.replace("Z", "+00:00")).replace(tzinfo=None)
-                else:
-                    opened_dt = opened_at
-                hold_mins = (now - opened_dt).total_seconds() / 60
-            except Exception:
-                pass
-
-        cooldown_mins = 0
-        rule_label    = ""
-
-        # Rule 3 (highest priority): flash close = loss AND held < threshold
-        flash_thresh = getattr(config, "COOLDOWN_FLASH_HOLD_THRESH", 15)
-        if realized_pnl < 0 and hold_mins < flash_thresh:
-            cooldown_mins = getattr(config, "COOLDOWN_FLASH_CLOSE_MIN", 120)
-            rule_label    = f"Rule3:FlashClose({hold_mins:.0f}min hold)"
-
-        # Rule 1: SL / trailing-SL / max-loss exit
-        elif exit_reason in ("STOP_LOSS", "TRAILING_SL", "MAX_LOSS"):
-            cooldown_mins = getattr(config, "COOLDOWN_SL_MINUTES", 90)
-            rule_label    = f"Rule1:{exit_reason}"
-
-        # Rule 2: generic loss close
-        elif realized_pnl < 0:
-            cooldown_mins = getattr(config, "COOLDOWN_LOSS_MINUTES", 45)
-            rule_label    = "Rule2:LossClose"
-
-        # Rule 4: same-direction repeat (additive only — applies even to break-even)
-        same_dir_mins = getattr(config, "COOLDOWN_SAME_DIR_MINUTES", 30)
-        if side and self._coin_last_side.get(sym) == side:
-            if cooldown_mins < same_dir_mins:
-                cooldown_mins = same_dir_mins
-                rule_label    = rule_label or "Rule4:SameDirRepeat"
-
-        # Track close for Rule 5 (daily cap) regardless of PnL
-        self._coin_daily_trades.setdefault(sym, []).append(now)
-        # Prune entries older than 24h
-        cutoff = now - timedelta(hours=24)
-        self._coin_daily_trades[sym] = [t for t in self._coin_daily_trades[sym] if t >= cutoff]
-
-        # Rule 5: daily cap exceeded → block to UTC midnight
-        daily_cap = getattr(config, "COOLDOWN_DAILY_CAP_TRADES", 3)
-        if len(self._coin_daily_trades[sym]) >= daily_cap:
-            from datetime import timezone
-            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            mins_to_midnight = (midnight - now).total_seconds() / 60
-            if mins_to_midnight > cooldown_mins:
-                cooldown_mins = mins_to_midnight
-                rule_label    = "Rule5:DailyCap"
-
-        # Store last side for Rule 4
-        if side:
-            self._coin_last_side[sym] = side
-
-        # Apply cooldown
-        if cooldown_mins > 0:
-            expiry = now + timedelta(minutes=cooldown_mins)
-            self._coin_cooldowns[sym] = expiry
-            logger.info(
-                "⏳ COOLDOWN [%s] for %.0f min until %s UTC (%s, PnL=%.1f%%, hold=%.0fm)",
-                sym, cooldown_mins, expiry.strftime("%H:%M"), rule_label, realized_pnl, hold_mins
-            )
-            # Update brain summary so dashboard shows the cooldown status
-            self._coin_states.setdefault(sym, {})["cooldown_until"] = expiry.isoformat() + "Z"
-            self._coin_states[sym]["cooldown_rule"] = rule_label
-
-    def _is_in_cooldown(self, sym: str) -> tuple[bool, str]:
-        """Return (True, reason) if the coin is under cooldown, else (False, '')."""
-        if not getattr(config, "COOLDOWN_ENABLED", True):
-            return False, ""
-        expiry = self._coin_cooldowns.get(sym)
-        if expiry is None:
-            return False, ""
-        now = datetime.utcnow()
-        if now < expiry:
-            remaining = (expiry - now).total_seconds() / 60
-            return True, f"cooldown {remaining:.0f}m (until {expiry.strftime('%H:%M')} UTC)"
-        # Expired — clean up
-        del self._coin_cooldowns[sym]
-        self._coin_states.get(sym, {}).pop("cooldown_until", None)
-        self._coin_states.get(sym, {}).pop("cooldown_rule", None)
-        return False, ""
-
-    # ── Segment Cooldown Methods ────────────────────────────────────────────────
-
-    def _apply_segment_cooldown(self, seg: str, trade: dict) -> None:
-        """Evaluate 5 segment cooldown rules for a just-closed trade, isolated by user_id."""
-        if not seg or not getattr(config, "SEG_COOLDOWN_ENABLED", True):
-            return
-
-        user_id = trade.get("user_id", getattr(config, "ENGINE_USER_ID", "default"))
-        seg_key = (user_id, seg)
-
-        now = datetime.utcnow()
-        exit_reason  = (trade.get("exit_reason") or "").upper()
-        realized_pnl = float(trade.get("realized_pnl_pct") or trade.get("pnl_pct") or 0)
-        is_loss      = realized_pnl < 0
-        is_sl        = exit_reason in ("STOP_LOSS", "TRAILING_SL", "MAX_LOSS")
-        is_tp        = exit_reason in ("TAKE_PROFIT", "TP")
-
-        # ── Track SL events (Rule 1) ──
-        if is_sl:
-            self._seg_sl_events.setdefault(seg_key, []).append(now)
-
-        # ── Track close history (Rule 2 + 5) ──
-        self._seg_close_history.setdefault(seg_key, []).append((now, realized_pnl))
-
-        # ── Consecutive loss counter (Rule 5) ──
-        if is_loss and not is_tp:
-            self._seg_consec_losses[seg_key] = self._seg_consec_losses.get(seg_key, 0) + 1
-        elif not is_loss:
-            # Reset on any non-loss close (TP, break-even, profit)
-            self._seg_consec_losses[seg_key] = 0
-
-        cooldown_mins = 0
-        rule_label    = ""
-
-        # ── Rule 1: SL Burst ──
-        burst_window = getattr(config, "SEG_COOLDOWN_SL_BURST_WINDOW", 60)
-        burst_count  = getattr(config, "SEG_COOLDOWN_SL_BURST_COUNT", 2)
-        cutoff_r1    = now - timedelta(minutes=burst_window)
-        self._seg_sl_events[seg_key] = [t for t in self._seg_sl_events.get(seg_key, []) if t >= cutoff_r1]
-        if len(self._seg_sl_events.get(seg_key, [])) >= burst_count:
-            r1_mins = getattr(config, "SEG_COOLDOWN_SL_BURST_MINS", 90)
-            if r1_mins > cooldown_mins:
-                cooldown_mins = r1_mins
-                rule_label    = f"SegRule1:SL_Burst({len(self._seg_sl_events[seg_key])}x in {burst_window}m)"
-
-        # ── Rule 2: Segment Loss Rate (4h window, min 3 trades) ──
-        cutoff_r2 = now - timedelta(hours=4)
-        recent_closes = [(t, pnl) for t, pnl in self._seg_close_history.get(seg_key, []) if t >= cutoff_r2]
-        if len(recent_closes) >= 3:
-            loss_count = sum(1 for _, pnl in recent_closes if pnl < 0)
-            loss_pct   = (loss_count / len(recent_closes)) * 100
-            threshold  = getattr(config, "SEG_COOLDOWN_LOSS_RATE_PCT", 60)
-            if loss_pct >= threshold:
-                r2_mins = getattr(config, "SEG_COOLDOWN_LOSS_RATE_MINS", 120)
-                if r2_mins > cooldown_mins:
-                    cooldown_mins = r2_mins
-                    rule_label    = f"SegRule2:LossRate({loss_pct:.0f}%>{threshold}%)"
-
-        # ── Rule 5: Consecutive Losses ──
-        consec_thresh = getattr(config, "SEG_COOLDOWN_CONSEC_LOSS", 3)
-        if self._seg_consec_losses.get(seg_key, 0) >= consec_thresh:
-            r5_mins = getattr(config, "SEG_COOLDOWN_CONSEC_LOSS_MINS", 240)
-            if r5_mins > cooldown_mins:
-                cooldown_mins = r5_mins
-                rule_label    = f"SegRule5:ConsecLoss({self._seg_consec_losses[seg_key]}x)"
-
-        # ── Prune old close history (keep last 24h) ──
-        prune_cutoff = now - timedelta(hours=24)
-        self._seg_close_history[seg_key] = [(t, p) for t, p in self._seg_close_history.get(seg_key, []) if t >= prune_cutoff]
-
-        # ── Apply cooldown if any rule triggered ──
-        if cooldown_mins > 0:
-            expiry = now + timedelta(minutes=cooldown_mins)
-            # Only extend, never shorten an existing cooldown
-            existing = self._seg_cooldowns.get(seg_key)
-            if existing is None or expiry > existing:
-                self._seg_cooldowns[seg_key] = expiry
-                logger.info(
-                    "🔒 SEGMENT_COOLDOWN [%s] for %.0f min until %s UTC (%s, PnL=%.1f%%)",
-                    seg, cooldown_mins, expiry.strftime("%H:%M"), rule_label, realized_pnl
-                )
-
-    def _is_segment_in_cooldown(self, seg: str, user_id: str = None) -> tuple:
-        """Return (True, reason) if segment is under cooldown for this user_id, else (False, '').
-        Also checks Rule 3 (max active) dynamically isolated to the user_id."""
-        if not seg or not getattr(config, "SEG_COOLDOWN_ENABLED", True):
-            return False, ""
-            
-        user_id = user_id or getattr(config, "ENGINE_USER_ID", "default")
-        seg_key = (user_id, seg)
-
-        # ── Rule 3: Overexposure (dynamic — checked at deploy time) ──
-        max_active = getattr(config, "SEG_COOLDOWN_MAX_ACTIVE", 3)
-        active_in_seg = sum(
-            1 for key, pos in self._active_positions.items()
-            if get_segment_for_coin(key.split(":")[-1] if ":" in key else key) == seg
-            and pos.get("user_id") == user_id
-        )
-        if active_in_seg >= max_active:
-            return True, f"SegRule3:MaxActive({active_in_seg}/{max_active})"
-
-        # ── Rule 4: Churn (checked at deploy time from _seg_open_count) ──
-        churn_window = getattr(config, "SEG_COOLDOWN_CHURN_WINDOW", 360)
-        churn_count  = getattr(config, "SEG_COOLDOWN_CHURN_COUNT", 4)
-        now = datetime.utcnow()
-        cutoff_r4 = now - timedelta(minutes=churn_window)
-        self._seg_open_count[seg_key] = [t for t in self._seg_open_count.get(seg_key, []) if t >= cutoff_r4]
-        if len(self._seg_open_count.get(seg_key, [])) >= churn_count:
-            churn_mins = getattr(config, "SEG_COOLDOWN_CHURN_MINS", 180)
-            expiry = now + timedelta(minutes=churn_mins)
-            existing = self._seg_cooldowns.get(seg_key)
-            if existing is None or expiry > existing:
-                self._seg_cooldowns[seg_key] = expiry
-                logger.info(
-                    "🔒 SEGMENT_COOLDOWN [%s] Rule4:Churn (%d opens in %dm) → %dm block",
-                    seg_key, len(self._seg_open_count[seg_key]), churn_window, churn_mins
-                )
-
-        # ── Time-based cooldown check (Rules 1, 2, 4, 5) ──
-        expiry = self._seg_cooldowns.get(seg_key)
-        if expiry is None:
-            return False, ""
-        if now < expiry:
-            remaining = (expiry - now).total_seconds() / 60
-            return True, f"segment_cooldown {remaining:.0f}m (until {expiry.strftime('%H:%M')} UTC)"
-        # Expired — clean up
-        del self._seg_cooldowns[seg_key]
-        return False, ""
-
-    def _record_segment_open(self, seg: str, user_id: str = None) -> None:
-        """Track a new deployment for segment churn detection (Rule 4), isolated per user."""
-        if seg and getattr(config, "SEG_COOLDOWN_ENABLED", True):
-            user_id = user_id or getattr(config, "ENGINE_USER_ID", "default")
-            seg_key = (user_id, seg)
-            self._seg_open_count.setdefault(seg_key, []).append(datetime.utcnow())
-
-
-
     def _sync_positions(self):
         """
         Remove entries from _active_positions that were auto-closed
         by the tradebook (e.g., SL/TP hit during paper-mode simulation).
         """
-        active_pos_keys = {_build_pos_key(t.get("bot_id", ""), t["symbol"]) for t in tradebook.get_active_trades()}
+        active_pos_keys = {_build_pos_key(t.get("bot_id", ""), t["symbol"], t.get("user_id", "")) for t in tradebook.get_all_active_trades()}
         # Get full closed trade data to pass to _apply_cooldown
         try:
             all_trades = tradebook.get_all_trades() if hasattr(tradebook, "get_all_trades") else []
             recent_closed = {_build_pos_key(t.get("bot_id", ""), t["symbol"]): t for t in all_trades if (t.get("status") or "").lower() != "active"}
-        except Exception:
+        except Exception as e:
+            try:
+                logger.debug('Exception caught: %s', e, exc_info=True)
+            except NameError:
+                pass
             recent_closed = {}
 
         closed_out = [key for key in self._active_positions if key not in active_pos_keys]
@@ -2652,11 +2831,11 @@ class RegimeMasterBot:
             # Apply cooldown using the closed trade record
             closed_trade = recent_closed.get(key, {})
             if closed_trade:
-                self._apply_cooldown(sym, closed_trade)
+                self.risk_manager.apply_cooldown(sym, closed_trade)
                 # Apply segment cooldown alongside coin cooldown
                 seg = get_segment_for_coin(sym)
                 if seg:
-                    self._apply_segment_cooldown(seg, closed_trade)
+                    self.risk_manager.apply_segment_cooldown(seg, closed_trade)
             del self._active_positions[key]
 
 
@@ -2670,7 +2849,7 @@ class RegimeMasterBot:
           3. Detects exchange-side closures → close in tradebook
           4. Updates mark prices for P&L calculation
         """
-        import coindcx_client as cdx
+
 
         try:
             cdx_positions = cdx.list_positions()
@@ -2687,7 +2866,11 @@ class RegimeMasterBot:
             pair = p.get("pair", "")
             try:
                 symbol = cdx.from_coindcx_pair(pair)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 continue
             cdx_active[symbol] = {
                 "pair":          pair,
@@ -2773,12 +2956,16 @@ class RegimeMasterBot:
 
             # Compute ATR (best-effort) for trailing
             try:
-                from data_pipeline import fetch_klines
-                from feature_engine import compute_all_features
+
+
                 df = fetch_klines(sym, "1h", limit=200)
                 df_feat = compute_all_features(df)
                 atr = float(df_feat["atr"].iloc[-1])
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 atr = pos["avg_price"] * 0.015  # fallback 1.5%
 
             capital = pos["locked_margin"] if pos["locked_margin"] > 0 else 100.0
@@ -2814,10 +3001,21 @@ class RegimeMasterBot:
             logger.info("  → Registered as %s", trade_id)
 
         # ── 3. Push CoinDCX mark prices to tradebook ────────────────
-        # This ensures unrealized P&L uses the exchange price, not Binance
+        # Stamp current_price on LIVE trades using exchange mark prices.
+        # NOTE: We do NOT call update_unrealized() here — it runs the full
+        # SL/TP/MAX_LOSS exit-check pipeline which already fires once per
+        # heartbeat (line ~578) with WS prices.  Calling it a second time
+        # causes every trade's "Exit check" log to appear twice, doubles
+        # tradebook I/O, and blocks the HMM deploy thread.
+        # Instead, cheaply patch current_price for display accuracy only.
         if cdx_active:
-            cdx_prices = {sym: pos["mark_price"] for sym, pos in cdx_active.items()}
-            tradebook.update_unrealized(prices=cdx_prices)
+            _live_trades = tradebook.get_active_trades()
+            for _lt in _live_trades:
+                _sym = _lt.get("symbol")
+                if _sym and _sym in cdx_active:
+                    _mark = cdx_active[_sym].get("mark_price")
+                    if _mark:
+                        tradebook.update_trade(_lt["trade_id"], {"current_price": round(float(_mark), 6)})
 
         # ── 4. MERGE active-trade data into multi_bot_state for dashboard ──
         # CRITICAL: Read existing state first, then merge — do NOT overwrite.
@@ -2857,7 +3055,11 @@ class RegimeMasterBot:
                 try:
                     with open(config.MULTI_STATE_FILE, "r") as f:
                         existing = json.load(f)
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
                     existing = {}
 
             # Merge: keep all existing coin_states, overlay active-trade updates
@@ -2878,108 +3080,6 @@ class RegimeMasterBot:
         except Exception as e:
             logger.debug("Failed to save multi_bot_state during sync: %s", e)
 
-    def _get_orderflow_stats(self) -> dict:
-        """Aggregate order flow stats for dashboard (Whale Walls, Inst. Flow, OBs)."""
-        if not self._orderflow:
-            return {}
-        
-        walls_count = 0
-        inst_flow_count = 0
-        total_exchanges = 0
-        total_order_blocks = 0
-        total_agg_bid_usd = 0.0
-        total_agg_ask_usd = 0.0
-        
-        # Scan recently analyzed coins
-        for sym in self._coin_states.keys():
-            sig = self._orderflow.get_signal(sym)
-            if sig:
-                walls_count += len(sig.bid_walls) + len(sig.ask_walls)
-                if abs(sig.cumulative_delta) > 0.5 or abs(sig.taker_buy_ratio - 0.5) > 0.1:
-                    inst_flow_count += 1
-                total_exchanges = max(total_exchanges, sig.exchange_count)
-                total_order_blocks += len(sig.order_blocks)
-                total_agg_bid_usd += sig.aggregated_bid_usd
-                total_agg_ask_usd += sig.aggregated_ask_usd
-                
-        return {
-            "WhaleWalls": walls_count,
-            "Institutional": inst_flow_count,
-            "exchange_count": total_exchanges,
-            "order_blocks_detected": total_order_blocks,
-            "agg_bid_usd": round(total_agg_bid_usd, 0),
-            "agg_ask_usd": round(total_agg_ask_usd, 0),
-        }
-
-    # ─── State Persistence ───────────────────────────────────────────────────
-
-    def _save_multi_state(self, symbols_scanned, eligible, deployed_count):
-        """Save multi-coin bot state for the dashboard."""
-        # Also save legacy single-coin state (backward compat)
-        top_coin = self._coin_states.get(config.PRIMARY_SYMBOL, {})
-        legacy_state = {
-            "timestamp":    datetime.now(IST).replace(tzinfo=None).isoformat(),
-            "symbol":       config.PRIMARY_SYMBOL,
-            "regime":       top_coin.get("regime", "SCANNING"),
-            "confidence":   top_coin.get("confidence", 0),
-            "action":       top_coin.get("action", "MULTI_SCAN"),
-            "trade_count":  self._trade_count,
-            "paper_mode":   config.PAPER_TRADE,
-        }
-        try:
-            with open(config.STATE_FILE, "w") as f:
-                json.dump(legacy_state, f, indent=2)
-        except Exception:
-            pass
-
-        # Multi-coin state
-        now_utc = datetime.utcnow()
-        next_analysis = datetime.utcfromtimestamp(
-            self._last_analysis_time + config.ANALYSIS_INTERVAL_SECONDS
-        ) if self._last_analysis_time else None
-
-        multi_state = {
-            "timestamp":        datetime.now(IST).replace(tzinfo=None).isoformat(),
-            "cycle":            self._cycle_count,
-            "coins_scanned":    len(symbols_scanned),
-            "eligible_count":   len(eligible),
-            "deployed_count":   deployed_count,
-            "total_trades":     self._trade_count,
-            "active_positions": self._active_positions,
-            "max_concurrent_positions": config.MAX_CONCURRENT_POSITIONS,
-            "coin_states":      self._coin_states,
-            "orderflow_stats":  self._get_orderflow_stats(),
-            "paper_mode":       config.PAPER_TRADE,
-            "cycle_execution_time_seconds": getattr(self, '_last_cycle_duration', 0),
-            "analysis_interval_seconds": config.ANALYSIS_INTERVAL_SECONDS,
-            # Timing fields — written directly so dashboard always has them
-            "last_analysis_time": now_utc.isoformat() + "Z",
-            "next_analysis_time": (next_analysis.isoformat() + "Z") if next_analysis else None,
-            "active_bots":  [{"bot_id": b.get("bot_id"), "bot_name": b.get("bot_name"),
-                              "segment": b.get("segment_filter", "ALL")}
-                             for b in list(config.ENGINE_ACTIVE_BOTS)],
-            # Veto log — last 20 entries newest-first for cockpit Veto Log tab
-            "veto_log":              list(reversed(self._veto_log[-20:])),
-            # Signal queue — count + detail for Brain Execution Summary
-            "pending_signals_count": len(self._pending_signals),
-            "pending_signals_detail": [
-                {
-                    "symbol":         sym,
-                    "queue_reason":   entry.get("queue_reason", "unknown"),
-                    "cycles_pending": entry.get("cycles_pending", 1),
-                    "conviction":     entry.get("result", {}).get("conviction", 0),
-                    "side":           entry.get("result", {}).get("side", ""),
-                    "expires_in_sec": max(0, round(entry.get("expires_at", 0) - time.time())),
-                }
-                for sym, entry in self._pending_signals.items()
-            ],
-        }
-        try:
-            with open(config.MULTI_STATE_FILE, "w") as f:
-                json.dump(multi_state, f, indent=2)
-        except Exception as e:
-            logger.error("Failed to save multi state: %s", e)
-
     def _evict_brain_cache(self):
         """LRU eviction: cap HMM brain caches to prevent OOM kills on Railway."""
         cap = self._BRAIN_CACHE_MAX
@@ -2999,7 +3099,7 @@ class RegimeMasterBot:
 
     def _process_commands(self):
         """Check for external commands (from dashboard kill switch)."""
-        import os
+
         try:
             if not os.path.exists(config.COMMANDS_FILE):
                 return
@@ -3037,5 +3137,23 @@ class RegimeMasterBot:
 # ─── Entry Point ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # ── Launch independent strategy bots (Pyxis / Axiom / Ratio) ──────────────
+    # These run on separate cycles (15m / 60m / 4h) and have NO dependency
+    # on the HMM engine, Athena, or any veto gate below.
+    try:
+
+        _sr = StrategyRunner()
+        _sr_thread = threading.Thread(
+            target=_sr.run_forever,
+            daemon=True,
+            name="StrategyRunner"
+        )
+        _sr_thread.start()
+        logger.info("🤖 StrategyRunner launched (Pyxis/60m | Axiom/15m | Ratio/4h)")
+    except Exception as _sr_err:
+        logger.warning("⚠️  StrategyRunner failed to start (non-critical): %s", _sr_err)
+
+    # ── Launch main HMM engine (Titan / Vanguard / Rogue) ─────────────────────
     bot = RegimeMasterBot()
     bot.run()
+

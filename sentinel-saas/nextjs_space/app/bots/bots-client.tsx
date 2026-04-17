@@ -35,13 +35,22 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   const [segmentPerf, setSegmentPerf] = useState<any[]>([]);
 
   /* ── Deploy Wizard State ── */
-  const [deployType, setDeployType] = useState<'adaptive' | 'segments'>('segments');
-  const [selectedSegments, setSelectedSegments] = useState<string[]>([]);
+
   
   const [deployExchange, setDeployExchange] = useState('binance');
   const [deployMode, setDeployMode] = useState('paper');
   const [deployMaxTrades, setDeployMaxTrades] = useState(10);
   const [deployCapitalPerTrade, setDeployCapitalPerTrade] = useState(100);
+  const [selectedBots, setSelectedBots] = useState<string[]>(['Titan', 'Vanguard', 'Rogue', 'Systematic', 'Momentum', 'Stat Arb']);
+
+  const availableBots = [
+    { id: 'Titan', name: 'Titan', subtitle: '(Slow)', icon: '🏛️', color: '#60A5FA', bgRef: 'rgba(59,130,246,0.1)', borderRef: 'rgba(59,130,246,0.5)', desc: 'Full protection mode. BTC chop & momentum veto active. Deploys in clear trends with HMM conviction ≥60%.' },
+    { id: 'Vanguard', name: 'Vanguard', subtitle: '(Moderate)', icon: '🛡️', color: '#FCD34D', bgRef: 'rgba(234,179,8,0.1)', borderRef: 'rgba(234,179,8,0.5)', desc: 'BTC sideways veto bypassed — trades during chop. Momentum alignment still enforced.' },
+    { id: 'Rogue', name: 'Rogue', subtitle: '(Aggressive)', icon: '⚡', color: '#F87171', bgRef: 'rgba(239,68,68,0.1)', borderRef: 'rgba(239,68,68,0.5)', desc: 'All macro vetoes disabled. Pure HMM execution. Highest risk. Operates in any condition.' },
+    { id: 'Systematic', name: 'Pyxis', subtitle: '(Systematic)', icon: '🧭', color: '#60A5FA', bgRef: 'rgba(59,130,246,0.1)', borderRef: 'rgba(59,130,246,0.5)', desc: 'Independent SMA crossover strategy. Runs autonomously on a 1h frequency. Isolated risk (1.5x SL).' },
+    { id: 'Momentum', name: 'Axiom', subtitle: '(Momentum)', icon: '📈', color: '#FCD34D', bgRef: 'rgba(234,179,8,0.1)', borderRef: 'rgba(234,179,8,0.5)', desc: 'Fast-cycle MACD/RSI/Bollinger momentum. Runs autonomously on a 15m frequency. Isolated risk (1.2x SL).' },
+    { id: 'Stat Arb', name: 'Ratio', subtitle: '(Stat Arb)', icon: '⚖️', color: '#F87171', bgRef: 'rgba(239,68,68,0.1)', borderRef: 'rgba(239,68,68,0.5)', desc: 'Cross-asset rolling return statistical arbitrage. Runs on a 4h frequency. Isolated risk (2.0x SL).' },
+  ];
   
   /* ── Intel Drawer State ── */
   const [intelSegmentId, setIntelSegmentId] = useState<string | null>(null);
@@ -60,7 +69,29 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
       if (stateRes.ok) {
         const d = await stateRes.json();
         const trades = d?.tradebook?.trades || [];
-        setTradesByBot(d?.tradesByBot || {});
+        
+        // Group trades by bot ID so BotCard can calculate PnL properly
+        const grouped: Record<string, any[]> = {};
+        for (const t of trades) {
+            const botName = (t.bot_name || t.botName || '').toLowerCase();
+            const bId = t.bot_id || t.botId;
+            let matchingBot = initialBots.find(b => b.id === bId);
+            if (!matchingBot) {
+                const modelKeywords = ['adaptive', 'standard', 'conservative', 'aggressive'];
+                const tradeModel = modelKeywords.find(k => botName.includes(k));
+                matchingBot = initialBots.find(b => {
+                    const bName = (b.name || '').toLowerCase();
+                    const bModel = modelKeywords.find(k => bName.includes(k));
+                    if (tradeModel && bModel) return tradeModel === bModel;
+                    return bName.includes(botName) || botName.includes(bName);
+                });
+            }
+            if (matchingBot) {
+                if (!grouped[matchingBot.id]) grouped[matchingBot.id] = [];
+                grouped[matchingBot.id].push(t);
+            }
+        }
+        setTradesByBot(grouped);
         const cs = d?.multi?.coin_states || {};
         const prices: Record<string, number> = {};
         for (const [sym, state] of Object.entries(cs)) {
@@ -109,34 +140,24 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   const handleDeployBots = async () => {
     setLoading(true);
     try {
-      let deployments: any[] = [];
-      
-      if (deployType === 'adaptive') {
-        deployments.push({ name: 'ALL', segment: 'ALL', coinList: [] });
-      } else if (deployType === 'segments') {
-        if (selectedSegments.length === 0) { alert('Please select at least one segment.'); setLoading(false); return; }
-        selectedSegments.forEach(segId => {
-          deployments.push({ 
-            name: segId,
-            segment: segId, 
-            coinList: [] 
-          });
-        });
-      }
+      const allDeployments = availableBots.map(b => ({
+        name: `${b.name} ${b.subtitle}`, segment: b.id, coinList: []
+      }));
+      const deployments = allDeployments.filter(d => selectedBots.includes(d.segment));
 
       const res = await fetch('/api/bots/create', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          exchange: deployExchange, 
+          exchange: deployExchange,
           mode: deployMode,
-          maxTrades: deployMaxTrades, 
+          maxTrades: deployMaxTrades,
           capitalPerTrade: deployCapitalPerTrade,
-          deployments
+          deployments,
         }),
       });
       if (res.ok) { setShowDeployModal(false); window.location.reload(); }
       else { const data = await res.json(); alert(data.error || 'Failed to deploy bots'); }
-    } catch (error) { console.error('Error deploying bot:', error); }
+    } catch (error) { console.error('Error deploying bots:', error); }
     finally { setLoading(false); }
   };
 
@@ -221,7 +242,7 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
   const stoppedBots = activeBots.filter((b: any) => !b?.isActive);
 
   // Derived Values
-  const botMultiplier = deployType === 'adaptive' ? 1 : Math.max(1, selectedSegments.length);
+  const botMultiplier = selectedBots.length; // deploy selected sum
   const totalMaxExposure = botMultiplier * deployMaxTrades * deployCapitalPerTrade;
 
   const intelData = useMemo(() => SEGMENT_KNOWLEDGE.find(s => s.id === intelSegmentId), [intelSegmentId]);
@@ -313,14 +334,14 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
             </motion.div>
           )}
 
-          {/* ════ BOT CARDS GRID (4×4) ════ */}
+          {/* ════ BOT ROWS LIST ════ */}
           {activeBots.length > 0 && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 40 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 40 }}>
               {activeBots.map((bot, i) => {
                 const botSessions = allSessions.filter((s: any) => s.botId === bot?.id);
                 const displayTrades = tradesByBot[bot?.id] ?? [];
                 return (
-                  <motion.div key={bot?.id} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.06 }}>
+                  <motion.div key={bot?.id} initial={{ opacity: 0, x: -12 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.05 }}>
                     <BotCard bot={bot} onToggle={handleBotToggle} onDelete={handleDeleteBot} onRetire={handleRetireBot} liveTradeCount={liveTradeCount} trades={displayTrades} sessions={botSessions} livePrices={livePrices} isToggling={!!togglingBots[bot?.id]} />
                   </motion.div>
                 );
@@ -384,80 +405,45 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
 
                 <div style={{ overflowY: 'auto', padding: '20px 24px', flex: 1 }}>
                   
-                  {/* Tab Selector */}
-                  <div style={{ display: 'flex', background: 'rgba(0,0,0,0.3)', borderRadius: 'var(--radius-md)', padding: 4, marginBottom: 24, border: '1px solid var(--color-border)' }}>
-                    {[{id: 'adaptive', label: 'Adaptive All-Market'}, {id: 'segments', label: 'By Segments'}].map(tab => (
-                      <button key={tab.id} onClick={() => setDeployType(tab.id as any)} style={{
-                        flex: 1, padding: '10px 0', fontSize: 'var(--text-xs)', fontWeight: 700, borderRadius: 'calc(var(--radius-md) - 2px)',
-                        background: deployType === tab.id ? 'rgba(34,197,94,0.15)' : 'transparent',
-                        color: deployType === tab.id ? '#4ADE80' : 'var(--color-text-secondary)',
-                        border: deployType === tab.id ? '1px solid rgba(34,197,94,0.3)' : '1px solid transparent',
-                        transition: 'all 0.2s'
-                      }}>{tab.label}</button>
-                    ))}
-                  </div>
-
-                  {/* Tab Contents */}
-                  <div style={{ minHeight: 180, marginBottom: 32 }}>
-
-                    {/* ADAPTIVE TYPE */}
-                    {deployType === 'adaptive' && (
-                      <div style={{
-                        padding: 24, borderRadius: 'var(--radius-lg)', background: 'linear-gradient(145deg, rgba(34,197,94,0.08) 0%, rgba(16,185,129,0.02) 100%)',
-                        border: '1px solid rgba(34,197,94,0.2)'
-                      }}>
-                        <div style={{ display: 'flex', gap: 16 }}>
-                          <div style={{ fontSize: 32 }}>🧠</div>
-                          <div>
-                            <h3 style={{ fontSize: 'var(--text-base)', fontWeight: 700, color: '#4ADE80', margin: '0 0 6px 0' }}>Synaptic Adaptive Protocol</h3>
-                            <p style={{ fontSize: 'var(--text-sm)', color: 'var(--color-text-secondary)', lineHeight: 1.5, margin: 0 }}>
-                              Deploys one master bot. It intelligently scans the entire market every cycle, computes the Institutional Segment Heatmap, and dynamically allocates its risk <i>only</i> to the Top 2 hottest segments on the market.
-                            </p>
+                  {/* SIX TIER BOTS — horizontal row selector */}
+                  <div style={{ marginBottom: 24 }}>
+                    <div style={{ fontSize: 'var(--text-xs)', fontWeight: 700, color: 'var(--color-text-muted)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 12 }}>{selectedBots.length} BOTS WILL BE DEPLOYED</div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      {availableBots.map(bot => {
+                        const selected = selectedBots.includes(bot.id);
+                        return (
+                          <div key={bot.id} onClick={() => setSelectedBots(prev => prev.includes(bot.id) ? prev.filter(b => b !== bot.id) : [...prev, bot.id])}
+                            style={{
+                              cursor: 'pointer',
+                              display: 'flex', alignItems: 'center', gap: 14,
+                              padding: '10px 14px', borderRadius: 'var(--radius-md)',
+                              background: selected ? bot.bgRef : 'rgba(255,255,255,0.02)',
+                              border: selected ? `1px solid ${bot.borderRef}` : '1px solid var(--color-border)',
+                              transition: 'all 0.18s',
+                              opacity: selected ? 1 : 0.55,
+                            }}
+                          >
+                            {/* Checkbox indicator */}
+                            <div style={{
+                              width: 18, height: 18, borderRadius: 5, flexShrink: 0,
+                              border: `2px solid ${selected ? bot.color : 'var(--color-border)'}`,
+                              background: selected ? bot.color + '30' : 'transparent',
+                              display: 'flex', alignItems: 'center', justifyContent: 'center',
+                              transition: 'all 0.18s',
+                              fontSize: 10,
+                            }}>
+                              {selected && '✓'}
+                            </div>
+                            <div style={{ fontSize: 18, flexShrink: 0 }}>{bot.icon}</div>
+                            <div style={{ flex: 1 }}>
+                              <span style={{ fontWeight: 700, fontSize: 'var(--text-sm)', color: bot.color }}>{bot.name}</span>
+                              <span style={{ color: 'var(--color-text-muted)', fontWeight: 400, fontSize: 'var(--text-sm)' }}> {bot.subtitle}</span>
+                            </div>
+                            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--color-text-secondary)', lineHeight: 1.4, maxWidth: 280, textAlign: 'right' }}>{bot.desc}</div>
                           </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {/* SEGMENTS TYPE */}
-                    {deployType === 'segments' && (
-                      <div>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                          <span className="section-title" style={{ margin: 0 }}>Select target segments</span>
-                          <button onClick={() => setSelectedSegments(SEGMENT_KNOWLEDGE.filter(s => s.id !== 'ALL').map(s => s.id))} className="text-btn" style={{ fontSize: 12 }}>Select All</button>
-                        </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 }}>
-                          {SEGMENT_KNOWLEDGE.filter(s => s.id !== 'ALL').map(seg => {
-                            const active = selectedSegments.includes(seg.id);
-                            return (
-                              <div key={seg.id} style={{
-                                display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 'var(--radius-md)', cursor: 'pointer',
-                                background: active ? 'rgba(34,197,94,0.1)' : 'rgba(255,255,255,0.03)',
-                                border: `1px solid ${active ? 'var(--color-success)' : 'var(--color-border)'}`, transition: 'all 0.2s', position: 'relative'
-                              }} onClick={() => setSelectedSegments(prev => active ? prev.filter(id => id !== seg.id) : [...prev, seg.id])}>
-                                <div style={{ fontSize: 20 }}>{seg.icon}</div>
-                                <div style={{ flex: 1, minWidth: 0 }}>
-                                  <div style={{ fontSize: 'var(--text-sm)', fontWeight: 700, color: active ? 'var(--color-success)' : 'var(--color-text)' }}>{seg.name}</div>
-                                  <div style={{ fontSize: 10, color: 'var(--color-text-muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{seg.coins.length} coins tracked</div>
-                                </div>
-                                
-                                {/* Intel Trigger */}
-                                <button 
-                                  onClick={(e) => { e.stopPropagation(); setIntelSegmentId(seg.id); }}
-                                  style={{
-                                    background: 'transparent', border: 'none', color: 'var(--color-info)', cursor: 'pointer', padding: 4, opacity: 0.7
-                                  }}
-                                  title="Learn about this segment"
-                                >
-                                  <Info size={16} />
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-
-
+                        );
+                      })}
+                    </div>
                   </div>
 
                   <hr style={{ border: 'none', borderTop: '1px solid var(--color-border)', margin: '0 0 24px 0' }} />
@@ -520,7 +506,7 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
                       <span style={{ color: 'var(--color-text-secondary)' }}>Maximum Total Exposure</span>
                       <div style={{ textAlign: 'right' }}>
                         <span style={{ fontFamily: 'monospace', fontWeight: 800, color: 'var(--color-info)', fontSize: 18 }}>${totalMaxExposure.toLocaleString()}</span>
-                        <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginTop: 2 }}>{botMultiplier} Bots × {deployMaxTrades} Trades × ${deployCapitalPerTrade}</div>
+                        <div style={{ fontSize: 10, color: 'var(--color-text-muted)', marginTop: 2 }}>{selectedBots.length} Bot{selectedBots.length === 1 ? '' : 's'} × {deployMaxTrades} Trades × ${deployCapitalPerTrade}</div>
                       </div>
                     </div>
                   </div>
@@ -530,8 +516,8 @@ export function BotsClient({ bots: initialBots }: BotsClientProps) {
                 {/* Footer Controls */}
                 <div style={{ display: 'flex', gap: 12, padding: '16px 24px 20px', borderTop: '1px solid var(--color-border)', background: 'rgba(13,20,32,0.8)' }}>
                   <button onClick={() => setShowDeployModal(false)} className="btn-ghost" style={{ flex: 1, padding: '12px 0' }}>Cancel</button>
-                  <button onClick={handleDeployBots} disabled={loading} className="btn-success" style={{ flex: 2, padding: '12px 0', fontSize: 15, opacity: loading ? 0.7 : 1 }}>
-                    <Rocket style={{ width: 16, height: 16 }} /> {loading ? 'Launching Matrix...' : `Deploy ${botMultiplier} Bot${botMultiplier !== 1? 's':''}`}
+                  <button onClick={handleDeployBots} disabled={loading || selectedBots.length === 0} className="btn-success" style={{ flex: 2, padding: '12px 0', fontSize: 15, opacity: (loading || selectedBots.length === 0) ? 0.7 : 1 }}>
+                    <Rocket style={{ width: 16, height: 16 }} /> {loading ? `Deploying ${selectedBots.length} Bots...` : `Deploy ${selectedBots.length} Bot${selectedBots.length === 1 ? '' : 's'}`}
                   </button>
                 </div>
               </div>

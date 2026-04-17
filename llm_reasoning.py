@@ -57,6 +57,7 @@ class AthenaDecision:
     cached: bool = False    # Whether this was a cache hit
     suggested_sl: float = 0.0   # Athena's recommended stop-loss (0 = not provided)
     suggested_tp: float = 0.0   # Athena's recommended target/take-profit (0 = not provided)
+    recommended_leverage: int = 0  # 3-10x leverage as dynamically commanded by Athena
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -275,7 +276,8 @@ class AthenaEngine:
 
     def __init__(self):
         self._model = None
-        self._cache: Dict[str, tuple] = {}  # symbol → (AthenaDecision, expiry_time)
+        self._cache: Dict[str, tuple] = {}  # "symbol:segment:side" → (AthenaDecision, expiry_time)
+                                             # FIX: keyed on full context, not just symbol
         self._cycle_call_count = 0
         self._cycle_start = 0.0
         self._initialized = False
@@ -336,8 +338,13 @@ class AthenaEngine:
         """
         symbol = signal_context.get("ticker", "UNKNOWN")
 
-        # 1. Check cache first
-        cached = self._check_cache(symbol)
+        # 1. Check cache first (keyed on symbol:segment:side)
+        _cache_key = "{}:{}:{}".format(
+            symbol,
+            signal_context.get("segment", "ALL"),
+            signal_context.get("side", "BUY"),
+        )
+        cached = self._check_cache(_cache_key)
         if cached:
             logger.info("🏛️ Athena [%s] → %s (cached)", symbol, cached.action)
             # Only log cached decisions that have real reasoning — skip stale/empty ones
@@ -512,6 +519,17 @@ class AthenaEngine:
         suggested_sl = _parse_price(data.get("stop_loss"))
         suggested_tp = _parse_price(data.get("target"))
 
+        rec_lev = 0
+        if data.get("leverage_recommendation"):
+            try:
+                import re
+                s = str(data["leverage_recommendation"])
+                m = re.search(r'\d+', s)
+                if m:
+                    rec_lev = int(m.group(0))
+            except Exception:
+                pass
+
         decision = AthenaDecision(
             action=action,
             adjusted_confidence=adj_conf,
@@ -522,13 +540,19 @@ class AthenaEngine:
             latency_ms=latency_ms,
             suggested_sl=suggested_sl,
             suggested_tp=suggested_tp,
+            recommended_leverage=rec_lev,
         )
         # Store entry price for logging/display
         suggested_entry = _parse_price(data.get("entry_price"))
         decision.suggested_entry = suggested_entry
 
-        # Cache and log
-        self._set_cache(symbol, decision)
+        # Cache and log (scoped to symbol:segment:side context)
+        _cache_key = "{}:{}:{}".format(
+            symbol,
+            ctx.get("segment", "ALL"),
+            ctx.get("side", "BUY"),
+        )
+        self._set_cache(_cache_key, decision)
         self._log_decision(symbol, ctx, decision)
 
         logger.info(
@@ -681,7 +705,9 @@ class AthenaEngine:
         derivatives_block = (
             f"- Funding Rate     : {fr_str}\n"
             f"- OI Change        : {oi_str}\n"
-            f"- Orderflow Score  : {of_str}"
+            f"- Orderflow Score  : {of_str}\n"
+            f"- RSI (1h)         : {ctx.get('rsi_1h', 'N/A')}  "
+            f"({'⚠️ overbought' if (ctx.get('rsi_1h') or 50) > 65 else '⚠️ oversold' if (ctx.get('rsi_1h') or 50) < 35 else 'neutral'})"
         )
 
         return f"""## Signal Under Review: {ctx.get('ticker', 'N/A')}
@@ -692,6 +718,7 @@ class AthenaEngine:
 - HMM Confidence   : {ctx.get('hmm_confidence', 0):.4f}  (margin best vs 2nd-best state)
 - Multi-TF Conviction: {conv:.1f}/100  [{conv_label}]
 - TF Agreement     : {ctx.get('tf_agreement', 0)}/3 timeframes agree
+- Loss Streak      : {ctx.get('loss_streak', 0)} consecutive losses (0 = clean slate)
 
 ### ── Per-Timeframe Breakdown ──
 {tf_str}
@@ -802,15 +829,14 @@ class AthenaEngine:
 
 Return your analysis as a single JSON object."""
 
-    def _check_cache(self, symbol: str) -> Optional[AthenaDecision]:
+    def _check_cache(self, cache_key: str) -> Optional[AthenaDecision]:
         """Return cached decision if still valid AND has real reasoning.
         
-        Evicts the cache entry if reasoning is empty/stale so the next call
-        immediately triggers a fresh Gemini API call — prevents 'No reasoning
-        provided' from persisting for the full cache window after a fix deploys.
+        Cache key is 'symbol:segment:side' — scoped to routing context
+        to prevent cross-bot cache collisions.
         """
-        if symbol in self._cache:
-            decision, expiry = self._cache[symbol]
+        if cache_key in self._cache:
+            decision, expiry = self._cache[cache_key]
             if time.time() < expiry:
                 # Evict stale reasoning — treat as cache miss to force fresh API call
                 _STALE = (
@@ -820,8 +846,8 @@ Return your analysis as a single JSON object."""
                     decision.reasoning.startswith("REST API error")
                 )
                 if _STALE:
-                    del self._cache[symbol]
-                    logger.debug("🏛️ Athena [%s] cache evicted — empty reasoning, forcing fresh call", symbol)
+                    del self._cache[cache_key]
+                    logger.debug("🏛️ Athena [%s] cache evicted — empty reasoning, forcing fresh call", cache_key)
                     return None
                 cached_decision = AthenaDecision(
                     action=decision.action,
@@ -834,13 +860,13 @@ Return your analysis as a single JSON object."""
                 )
                 return cached_decision
             else:
-                del self._cache[symbol]
+                del self._cache[cache_key]
         return None
 
-    def _set_cache(self, symbol: str, decision: AthenaDecision):
-        """Cache a decision for LLM_CACHE_MINUTES."""
+    def _set_cache(self, cache_key: str, decision: AthenaDecision):
+        """Cache a decision for LLM_CACHE_MINUTES. Key is 'symbol:segment:side'."""
         expiry = time.time() + config.LLM_CACHE_MINUTES * 60
-        self._cache[symbol] = (decision, expiry)
+        self._cache[cache_key] = (decision, expiry)
 
     def _default_execute(self, symbol: str, reason: str = "") -> AthenaDecision:
         """Return a default EXECUTE decision (fail-open)."""

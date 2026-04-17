@@ -7,8 +7,13 @@ import json
 import os
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from data_pipeline import get_current_price
+
+try:
+    import redis
+except ImportError:
+    redis = None
 import config
 import telegram as tg
 
@@ -16,30 +21,59 @@ logger = logging.getLogger("Tradebook")
 
 TRADEBOOK_FILE = os.path.join(config.DATA_DIR, "tradebook.json")
 
-# H2 FIX: Thread lock for concurrent file access safety
-_book_lock = threading.Lock()
+# B1 FIX: Single lock guards the full load-modify-save cycle (TOCTOU fix).
+# Do NOT hold the lock separately in _load_book or _save_book — always use
+# _atomic_update() for any operation that reads AND writes the tradebook.
+_book_lock = threading.RLock()  # RLock: allows re-entrant calls from the same thread
 
 
 def _load_book():
-    """Load tradebook from disk (thread-safe)."""
-    with _book_lock:
-        if not os.path.exists(TRADEBOOK_FILE):
-            return {"trades": [], "summary": {}}
+    """Load tradebook from disk. MUST be called while holding _book_lock."""
+    if not os.path.exists(TRADEBOOK_FILE):
+        return {"trades": [], "summary": {}}
+    try:
+        with open(TRADEBOOK_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
         try:
-            with open(TRADEBOOK_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {"trades": [], "summary": {}}
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
+        return {"trades": [], "summary": {}}
 
 
 def _save_book(book):
-    """Save tradebook to disk (thread-safe)."""
+    """Save tradebook to disk. MUST be called while holding _book_lock."""
+    try:
+        with open(TRADEBOOK_FILE, "w") as f:
+            json.dump(book, f, indent=2)
+            
+        # --- PHASE 2A: REDIS STATE PUSH ---
+        if redis:
+            r = redis.from_url(config.REDIS_URL, decode_responses=True)
+            r.set("synaptic:tradebook", json.dumps(book))
+    except Exception as e:
+        logger.error("Failed to save tradebook: %s", e)
+
+
+def _atomic_update(fn):
+    """
+    B1 FIX: Atomic read-modify-write pattern.
+    Holds _book_lock for the ENTIRE load → fn(book) → save cycle.
+    All public functions that mutate the tradebook MUST call this.
+
+    Usage:
+        def _do_something():
+            with _book_lock:
+                book = _load_book()
+                # ... mutate book ...
+                _save_book(book)
+    """
     with _book_lock:
-        try:
-            with open(TRADEBOOK_FILE, "w") as f:
-                json.dump(book, f, indent=2)
-        except Exception as e:
-            logger.error("Failed to save tradebook: %s", e)
+        book = _load_book()
+        result = fn(book)
+        _save_book(book)
+        return result
 
 
 def _next_id(book):
@@ -91,7 +125,7 @@ def _compute_summary(book):
         "best_trade": round(max((t.get("realized_pnl", 0) for t in closed), default=0), 4),
         "worst_trade": round(min((t.get("realized_pnl", 0) for t in closed), default=0), 4),
         "avg_leverage": round(sum(t.get("leverage", 1) for t in trades) / total, 1) if total else 0,
-        "last_updated": datetime.utcnow().isoformat(),
+        "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -104,7 +138,7 @@ def open_trade(symbol, side, leverage, quantity, entry_price, atr,
                profile_id="standard", bot_name="Synaptic Adaptive",
                exchange=None, pair=None, position_id=None, bot_id=None, all_bot_ids=None,
                rm_id=None, override_sl=None, override_tp=None, status="ACTIVE",
-               order_type=None, athena_reasoning=None):
+               order_type=None, athena_reasoning=None, target_capital=None, dca_level=1):
     """
     Record a new trade entry in the tradebook.
 
@@ -125,134 +159,157 @@ def open_trade(symbol, side, leverage, quantity, entry_price, atr,
     -------
     str : trade_id
     """
-    book = _load_book()
+    with _book_lock:
+        book = _load_book()
 
-    # Guard 1: same BOT already has this symbol active — block regardless of direction.
-    # This is the tightest check and catches same-bot duplicates (e.g. two AR LONGs).
-    if bot_id:
-        bot_existing = [t for t in book["trades"]
-                        if t["symbol"] == symbol
-                        and t.get("bot_id", "") == bot_id
-                        and t["status"] in ("ACTIVE", "OPEN")]
-        if bot_existing:
-            logger.warning(
-                "⚠️ Skipping trade for %s [bot=%s] — this bot already has ACTIVE trade %s",
-                symbol, bot_id, bot_existing[0]["trade_id"]
+        # Guard 1: same BOT already has this symbol active — block regardless of direction.
+        # This is the tightest check and catches same-bot duplicates (e.g. two AR LONGs).
+        if bot_id:
+            bot_existing = [t for t in book["trades"]
+                            if t["symbol"] == symbol
+                            and t.get("bot_id", "") == bot_id
+                            and t["status"] in ("ACTIVE", "OPEN")]
+            if bot_existing:
+                logger.warning(
+                    "⚠️ Skipping trade for %s [bot=%s] — this bot already has ACTIVE trade %s",
+                    symbol, bot_id, bot_existing[0]["trade_id"]
+                )
+                return bot_existing[0]["trade_id"]
+
+        # Guard 2 (per-user cross-bot dedup) intentionally removed.
+        # It was blocking trades across different users who happened to trade the same coin.
+        # Per-bot dedup (Guard 1) is sufficient — each bot manages its own positions.
+
+        # ── Per-bot-per-mode trade cap (atomic Gate) ──────────────────────────────────
+        # CRITICAL: This must run inside _book_lock so concurrent open_trade() calls
+        # from the StrategyRunner signal loop can't all read the same stale count and
+        # each think they're under the cap. Without the lock, 50+ signals → 50+ trades.
+        _max_bot_trades = getattr(config, "MAX_USER_TRADES_PER_MODE", 10)
+        if bot_id and _max_bot_trades:
+            _trade_mode = (mode or ("paper" if config.PAPER_TRADE else "live")).lower()
+            _bot_active = sum(
+                1 for t in book["trades"]
+                if t.get("bot_id") == bot_id
+                and t["status"] in ("ACTIVE", "OPEN")
+                and str(t.get("mode", "paper")).lower() == _trade_mode
             )
-            return bot_existing[0]["trade_id"]
+            if _bot_active >= _max_bot_trades:
+                logger.warning(
+                    "🚫 open_trade BLOCKED for %s [bot=%s mode=%s]: trade cap hit (%d/%d active)",
+                    symbol, bot_id, _trade_mode, _bot_active, _max_bot_trades
+                )
+                return None
 
-    # Guard 2 (per-user cross-bot dedup) intentionally removed.
-    # It was blocking trades across different users who happened to trade the same coin.
-    # Per-bot dedup (Guard 1) is sufficient — each bot manages its own positions.
+        trade_id = _next_id(book)
+        position = "LONG" if side == "BUY" else "SHORT"
 
-    trade_id = _next_id(book)
-    position = "LONG" if side == "BUY" else "SHORT"
-
-    # Compute SL/TP based on ATR (adjusted for leverage)
-    if override_sl is not None and override_tp is not None:
-        stop_loss = round(override_sl, 6)
-        take_profit = round(override_tp, 6)
-        t1_price = None
-        t2_price = None
-        t3_price = None
-        
-        # RM5_Trailing locks 50% at 2% and trails the rest
-        if rm_id == "RM5_Trailing":
-            direction = 1 if position == "LONG" else -1
-            t1_price = round(entry_price + direction * (entry_price * 0.02), 6)
-    else:
-        sl_mult, tp_mult = config.get_atr_multipliers(leverage)
-
-        # ── Multi-Target System (0304_v1) ──
-        if getattr(config, 'MULTI_TARGET_ENABLED', False):
-            sl_dist = atr * sl_mult
-            t3_dist = sl_dist * config.MT_RR_RATIO  # 1:5 R:R
-            if position == "LONG":
-                stop_loss = round(entry_price - sl_dist, 6)
-                t1_price = round(entry_price + t3_dist * config.MT_T1_FRAC, 6)
-                t2_price = round(entry_price + t3_dist * config.MT_T2_FRAC, 6)
-                t3_price = round(entry_price + t3_dist, 6)
-            else:
-                stop_loss = round(entry_price + sl_dist, 6)
-                t1_price = round(entry_price - t3_dist * config.MT_T1_FRAC, 6)
-                t2_price = round(entry_price - t3_dist * config.MT_T2_FRAC, 6)
-                t3_price = round(entry_price - t3_dist, 6)
-            take_profit = t3_price  # TP = T3 for display
-        else:
-            if position == "LONG":
-                stop_loss = round(entry_price - atr * sl_mult, 6)
-                take_profit = round(entry_price + atr * tp_mult, 6)
-            else:
-                stop_loss = round(entry_price + atr * sl_mult, 6)
-                take_profit = round(entry_price - atr * tp_mult, 6)
+        # Compute SL/TP based on ATR (adjusted for leverage)
+        if override_sl is not None and override_tp is not None:
+            stop_loss = round(override_sl, 6)
+            take_profit = round(override_tp, 6)
             t1_price = None
             t2_price = None
             t3_price = None
+            
+            # RM5_Trailing locks 50% at 2% and trails the rest
+            if rm_id == "RM5_Trailing":
+                direction = 1 if position == "LONG" else -1
+                t1_price = round(entry_price + direction * (entry_price * 0.02), 6)
+        else:
+            sl_mult, tp_mult = config.get_atr_multipliers(leverage)
 
-    now_iso = datetime.utcnow().isoformat()
-    trade = {
-        "trade_id":         trade_id,
-        "entry_timestamp":  now_iso,
-        "exit_timestamp":   None,
-        "symbol":           symbol,
-        "position":         position,
-        "side":             side,
-        "regime":           regime,
-        "confidence":       round(confidence, 4) if confidence else 0,
-        "leverage":         leverage,
-        "capital":          capital,
-        "quantity":         round(quantity, 6),
-        "entry_price":      round(entry_price, 6),
-        "exit_price":       None,
-        "current_price":    round(entry_price, 6),
-        "stop_loss":        stop_loss,
-        "take_profit":      take_profit,
-        "atr_at_entry":     round(atr, 6),
-        "trailing_sl":      stop_loss,
-        "trailing_tp":      take_profit,
-        "peak_price":       round(entry_price, 6),
-        "trailing_active":  False,
-        "trail_sl_count":   0,
-        "tp_extensions":    0,
-        # Multi-target fields
-        "t1_price":         t1_price,
-        "t2_price":         t2_price,
-        "t3_price":         t3_price,
-        "t1_hit":           False,
-        "t2_hit":           False,
-        "original_qty":     round(quantity, 6),
-        "original_capital": capital,
-        "status":           status,
-        "exit_reason":      None,
-        "realized_pnl":     0,
-        "realized_pnl_pct": 0,
-        "unrealized_pnl":   0,
-        "unrealized_pnl_pct": 0,
-        "max_favorable":    0,
-        "max_adverse":      0,
-        "duration_minutes":  0,
-        "mode":             mode if mode else ("PAPER" if config.PAPER_TRADE else "LIVE"),
-        "user_id":          user_id,
-        "commission":       0,
-        "funding_cost":     0,
-        "funding_payments": 0,
-        "last_funding_check": now_iso,
-        "profile_id":       profile_id,
-        "bot_name":         bot_name,
-        "bot_id":           bot_id or "",  # Stamp real bot_id for per-bot trade isolation
-        "all_bot_ids":      all_bot_ids or [],  # Multi-bot: list of all active bot IDs at trade time
-        # CoinDCX exchange tracking
-        "exchange":         exchange,
-        "pair":             pair,
-        "position_id":      position_id,
-        "rm_id":            rm_id,
-        "order_type":       order_type,
-        "athena_reasoning": athena_reasoning,
-    }
+            # ── Multi-Target System (0304_v1) ──
+            if getattr(config, 'MULTI_TARGET_ENABLED', False):
+                sl_dist = atr * sl_mult
+                t3_dist = sl_dist * config.MT_RR_RATIO  # 1:5 R:R
+                if position == "LONG":
+                    stop_loss = round(entry_price - sl_dist, 6)
+                    t1_price = round(entry_price + t3_dist * config.MT_T1_FRAC, 6)
+                    t2_price = round(entry_price + t3_dist * config.MT_T2_FRAC, 6)
+                    t3_price = round(entry_price + t3_dist, 6)
+                else:
+                    stop_loss = round(entry_price + sl_dist, 6)
+                    t1_price = round(entry_price - t3_dist * config.MT_T1_FRAC, 6)
+                    t2_price = round(entry_price - t3_dist * config.MT_T2_FRAC, 6)
+                    t3_price = round(entry_price - t3_dist, 6)
+                take_profit = t3_price  # TP = T3 for display
+            else:
+                if position == "LONG":
+                    stop_loss = round(entry_price - atr * sl_mult, 6)
+                    take_profit = round(entry_price + atr * tp_mult, 6)
+                else:
+                    stop_loss = round(entry_price + atr * sl_mult, 6)
+                    take_profit = round(entry_price - atr * tp_mult, 6)
+                t1_price = None
+                t2_price = None
+                t3_price = None
 
-    book["trades"].append(trade)
-    _compute_summary(book)
-    _save_book(book)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        trade = {
+            "trade_id":         trade_id,
+            "entry_timestamp":  now_iso,
+            "exit_timestamp":   None,
+            "symbol":           symbol,
+            "position":         position,
+            "side":             side,
+            "regime":           regime,
+            "confidence":       round(confidence, 4) if confidence else 0,
+            "leverage":         leverage,
+            "capital":          capital,
+            "target_capital":   target_capital or capital,
+            "dca_level":        dca_level,
+            "quantity":         round(quantity, 6),
+            "entry_price":      round(entry_price, 6),
+            "exit_price":       None,
+            "current_price":    round(entry_price, 6),
+            "stop_loss":        stop_loss,
+            "take_profit":      take_profit,
+            "atr_at_entry":     round(atr, 6),
+            "trailing_sl":      stop_loss,
+            "trailing_tp":      take_profit,
+            "peak_price":       round(entry_price, 6),
+            "trailing_active":  False,
+            "trail_sl_count":   0,
+            "tp_extensions":    0,
+            # Multi-target fields
+            "t1_price":         t1_price,
+            "t2_price":         t2_price,
+            "t3_price":         t3_price,
+            "t1_hit":           False,
+            "t2_hit":           False,
+            "original_qty":     round(quantity, 6),
+            "original_capital": capital,
+            "status":           status,
+            "exit_reason":      None,
+            "realized_pnl":     0,
+            "realized_pnl_pct": 0,
+            "unrealized_pnl":   0,
+            "unrealized_pnl_pct": 0,
+            "max_favorable":    0,
+            "max_adverse":      0,
+            "duration_minutes":  0,
+            "mode":             mode if mode else ("PAPER" if config.PAPER_TRADE else "LIVE"),
+            "user_id":          user_id,
+            "commission":       0,
+            "funding_cost":     0,
+            "funding_payments": 0,
+            "last_funding_check": now_iso,
+            "profile_id":       profile_id,
+            "bot_name":         bot_name,
+            "bot_id":           bot_id or "",  # Stamp real bot_id for per-bot trade isolation
+            "all_bot_ids":      all_bot_ids or [],  # Multi-bot: list of all active bot IDs at trade time
+            # CoinDCX exchange tracking
+            "exchange":         exchange,
+            "pair":             pair,
+            "position_id":      position_id,
+            "rm_id":            rm_id,
+            "order_type":       order_type,
+            "athena_reasoning": athena_reasoning,
+        }
+
+        book["trades"].append(trade)
+        _compute_summary(book)
+        _save_book(book)
 
     logger.info("📗 Tradebook OPEN: %s %s %s @ %.6f | %dx | Capital: $%.0f",
                 trade_id, position, symbol, entry_price, leverage, capital)
@@ -304,7 +361,11 @@ def close_trade(trade_id=None, symbol=None, exit_price=None, reason="MANUAL", ex
                     cdx_pair = target.get("pair") or cdx.to_coindcx_pair(target["symbol"])
                     if cdx_pair:
                         px = cdx.get_current_price(cdx_pair)
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.debug('Exception caught: %s', e, exc_info=True)
+                    except NameError:
+                        pass
                     pass
             if px is None:
                 px = get_current_price(target["symbol"]) or target["entry_price"]
@@ -337,9 +398,9 @@ def close_trade(trade_id=None, symbol=None, exit_price=None, reason="MANUAL", ex
 
         # Duration
         entry_time = datetime.fromisoformat(target["entry_timestamp"])
-        duration = (datetime.utcnow() - entry_time).total_seconds() / 60
+        duration = (datetime.now(timezone.utc) - entry_time.replace(tzinfo=timezone.utc) if entry_time.tzinfo is None else datetime.now(timezone.utc) - entry_time).total_seconds() / 60
 
-        target["exit_timestamp"] = datetime.utcnow().isoformat()
+        target["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
         target["exit_price"] = px
         target["current_price"] = px
         target["status"] = "CLOSED"
@@ -355,6 +416,25 @@ def close_trade(trade_id=None, symbol=None, exit_price=None, reason="MANUAL", ex
         logger.info("📕 Tradebook CLOSE: %s %s %s @ %.6f → %.6f | P&L: $%.4f (%.2f%%)",
                     target["trade_id"], target["position"], target["symbol"],
                     entry, px, net_pnl, pnl_pct)
+
+        # ── AI4Trade: Publish Trade Close ─────────────────────────────
+        ai4trade = getattr(config, "AI4TRADE_CLIENT", None)
+        if ai4trade and getattr(config, "AI4TRADE_ENABLED", False):
+            # Only publish closes for trades that had high enough conviction to open
+            min_conv = getattr(config, "AI4TRADE_MIN_CONVICTION", 70.0)
+            if target.get("confidence", 0) >= min_conv:
+                try:
+                    ai4trade.publish_trade_close(
+                        symbol=target["symbol"],
+                        side_was=target["position"],
+                        close_price=px,
+                        quantity=target["quantity"],
+                        pnl_pct=pnl_pct,
+                        close_reason=reason
+                    )
+                except Exception as e:
+                    logger.debug("AI4Trade close publish failed: %s", e)
+
         closed.append(target)
 
     _compute_summary(book)
@@ -371,7 +451,7 @@ def cancel_trade(trade_id, reason="CANCELLED"):
         if trade["status"] == "OPEN" and trade["trade_id"] == trade_id:
             trade["status"] = "CANCELLED"
             trade["exit_reason"] = reason
-            trade["exit_timestamp"] = datetime.utcnow().isoformat()
+            trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
             logger.info("🚫 Tradebook CANCEL: %s [%s]", trade_id, reason)
             cancelled = trade
             break
@@ -400,7 +480,7 @@ def activate_limit_order(trade_id, fill_price, fill_qty):
             trade["original_capital"] = trade["capital"]
             
             # Shift entry timestamp to when it actually filled
-            trade["entry_timestamp"] = datetime.utcnow().isoformat()
+            trade["entry_timestamp"] = datetime.now(timezone.utc).isoformat()
 
             logger.info("🟢 Tradebook ACTIVATE: %s filled @ %.6f (qty: %.6f) — now ACTIVE", 
                         trade_id, fill_price, fill_qty)
@@ -458,7 +538,7 @@ def _book_partial_inline(trade, book, exit_price, qty_frac, reason):
     pnl_pct = round(net_pnl / book_capital * 100, 2) if book_capital else 0
 
     entry_time = datetime.fromisoformat(trade["entry_timestamp"])
-    duration = (datetime.utcnow() - entry_time).total_seconds() / 60
+    duration = (datetime.now(timezone.utc) - (entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc))).total_seconds() / 60
 
     # Create child trade ID
     child_id = f"{trade['trade_id']}-{reason}"
@@ -467,7 +547,7 @@ def _book_partial_inline(trade, book, exit_price, qty_frac, reason):
         "trade_id":         child_id,
         "parent_trade_id":  trade["trade_id"],
         "entry_timestamp":  trade["entry_timestamp"],
-        "exit_timestamp":   datetime.utcnow().isoformat(),
+        "exit_timestamp":   datetime.now(timezone.utc).isoformat(),
         "symbol":           trade["symbol"],
         "position":         trade["position"],
         "side":             trade["side"],
@@ -518,7 +598,7 @@ def _book_partial_inline(trade, book, exit_price, qty_frac, reason):
         "rm_id":            trade.get("rm_id"),
         "order_type":       trade.get("order_type"),
         "athena_reasoning": trade.get("athena_reasoning"),
-        "last_funding_check": datetime.utcnow().isoformat(),
+        "last_funding_check": datetime.now(timezone.utc).isoformat(),
     }
 
     # Add child trade to the tradebook
@@ -535,7 +615,11 @@ def _book_partial_inline(trade, book, exit_price, qty_frac, reason):
     # Telegram notification
     try:
         tg.notify_trade_close(child_trade)
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
 
     return child_trade
@@ -567,9 +651,9 @@ def _close_trade_inline(trade, exit_price, reason):
     pnl_pct = round(net_pnl / capital * 100, 2) if capital else 0
 
     entry_time = datetime.fromisoformat(trade["entry_timestamp"])
-    duration = (datetime.utcnow() - entry_time).total_seconds() / 60
+    duration = (datetime.now(timezone.utc) - (entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc))).total_seconds() / 60
 
-    trade["exit_timestamp"] = datetime.utcnow().isoformat()
+    trade["exit_timestamp"] = datetime.now(timezone.utc).isoformat()
     trade["exit_price"] = px
     trade["current_price"] = px
     trade["status"] = "CLOSED"
@@ -590,7 +674,11 @@ def _close_trade_inline(trade, exit_price, reason):
         tg.notify_trade_close(trade)
         if reason == "MAX_LOSS":
             tg.notify_max_loss(trade["symbol"], pnl_pct, trade["trade_id"])
-    except Exception:
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
 
 
@@ -642,7 +730,11 @@ def _update_single_trade(trade, book, prices, funding_rates):
                 cdx_pair = trade.get("pair") or cdx.to_coindcx_pair(symbol)
                 if cdx_pair:
                     current = cdx.get_current_price(cdx_pair)
-            except Exception:
+            except Exception as e:
+                try:
+                    logger.debug('Exception caught: %s', e, exc_info=True)
+                except NameError:
+                    pass
                 current = None
         else:
             current = None
@@ -672,7 +764,7 @@ def _update_single_trade(trade, book, prices, funding_rates):
 
     try:
         last_check = datetime.fromisoformat(trade["last_funding_check"])
-        hours_since = (datetime.utcnow() - last_check).total_seconds() / 3600
+        hours_since = (datetime.now(timezone.utc) - (last_check if last_check.tzinfo else last_check.replace(tzinfo=timezone.utc))).total_seconds() / 3600
         intervals = int(hours_since / config.FUNDING_INTERVAL_HOURS)
         if intervals > 0:
             # Use live funding rate if available, else default
@@ -685,8 +777,12 @@ def _update_single_trade(trade, book, prices, funding_rates):
             new_cost = round(cost_per_interval * intervals, 6)
             trade["funding_cost"] = round(trade["funding_cost"] + new_cost, 6)
             trade["funding_payments"] += intervals
-            trade["last_funding_check"] = datetime.utcnow().isoformat()
-    except Exception:
+            trade["last_funding_check"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        try:
+            logger.debug('Exception caught: %s', e, exc_info=True)
+        except NameError:
+            pass
         pass
 
     funding_cost = trade.get("funding_cost", 0)
@@ -716,7 +812,8 @@ def _update_single_trade(trade, book, prices, funding_rates):
 
     # Duration
     entry_time = datetime.fromisoformat(trade["entry_timestamp"])
-    duration = (datetime.utcnow() - entry_time).total_seconds() / 60
+    entry_time_aware = entry_time if entry_time.tzinfo else entry_time.replace(tzinfo=timezone.utc)
+    duration = (datetime.now(timezone.utc) - entry_time_aware).total_seconds() / 60
 
     trade["current_price"] = current
     trade["unrealized_pnl"] = net_pnl
@@ -805,7 +902,7 @@ def _update_single_trade(trade, book, prices, funding_rates):
                         )
 
                         # For LIVE trades: modify exchange SL order
-                        is_live_trail = trade.get("mode") == "LIVE"
+                        is_live_trail = str(trade.get("mode", "paper")).upper() == "LIVE"
                         if is_live_trail:
                             try:
                                 from execution_engine import ExecutionEngine
@@ -822,7 +919,7 @@ def _update_single_trade(trade, book, prices, funding_rates):
     # For LIVE trades, CoinDCX handles SL/TP/MAX_LOSS via exchange.
     # PAPER_TRADE override: if config.PAPER_TRADE=True the entire
     # engine is simulated — always auto-close regardless of mode stamp.
-    is_live = trade.get("mode") == "LIVE"
+    is_live = str(trade.get("mode", "paper")).upper() == "LIVE"
     should_auto_close = (not is_live) or config.PAPER_TRADE
 
     # ── Stamp exit guard state on trade (synced to DB + UI on next heartbeat) ──
@@ -831,8 +928,10 @@ def _update_single_trade(trade, book, prices, funding_rates):
     trade["exit_check_at"]    = _dt.utcnow().isoformat() + "Z"
     trade["exit_check_price"] = round(float(current), 8)
 
-    # Diagnostic: promote to INFO so Railway logs show guard status without debug filter
-    logger.info(
+    # Diagnostic: demoted to DEBUG — with 60+ active trades this printed 60+
+    # lines per heartbeat cycle, flooding Railway logs and burying real signals.
+    # The guard state is stamped on the trade dict for dashboard inspection.
+    logger.debug(
         "Exit check [%s]: mode=%s is_live=%s guard=%s "
         "pnl=%.2f%% eff_sl=%.6f eff_tp=%.6f price=%.6f",
         trade.get("trade_id"), trade.get("mode"), is_live, should_auto_close,
@@ -842,18 +941,128 @@ def _update_single_trade(trade, book, prices, funding_rates):
         current,
     )
 
-    # HARD MAX LOSS GUARD (paper + live safety net)
-    max_loss_limit = config.MAX_LOSS_PER_TRADE_PCT
+    # ── DCA PHASE TRIGGER ─────────────────────────────────────────
+    # If the trade is in the red, check if we've hit a new DCA phase trigger.
+    dca_phases = getattr(config, "DCA_PHASES", [])
+    current_level = trade.get("dca_level", 1)
+    lev = trade.get("leverage", getattr(config, "MIN_LEVERAGE_FLOOR", 10))
+    
+    if len(dca_phases) > current_level:
+        next_phase = dca_phases[current_level]
+        if pnl_pct <= next_phase["trigger_pnl_pct"]:
+            # --- DCA CONTAGION LOOPHOLE PATCH ---
+            # Count how many trades are already in deep DCA (Phase 2+) across the global book structure
+            # to prevent multiple simultaneous plunging assets from destroying all free margin.
+            dca_distress_count = sum(1 for t in book["trades"] if t["status"] in ("ACTIVE", "OPEN") and t.get("dca_level", 1) > 1)
+            if dca_distress_count >= getattr(config, "MAX_DCA_DISTRESS_TRADES", 2):
+                logger.warning(
+                    "❄️ DCA CONTAGION FREEZE: Refusing to execute DCA %s for %s. System already has %d distressed trades.",
+                    next_phase["name"], symbol, dca_distress_count
+                )
+                return  # Skip averaging down to protect capital
+
+            # Trigger DCA! Calculate the quantity to add
+            target_cap = trade.get("target_capital") or trade.get("capital", 100.0)
+            alloc_pct = next_phase["alloc_pct"]
+            capital_to_add = target_cap * alloc_pct
+            
+            try:
+                qty_to_add = (capital_to_add * lev) / current
+                
+                # If LIVE, send the buy order via execution engine
+                if is_live:
+                    from execution_engine import ExecutionEngine
+                    ExecutionEngine.add_to_position_live(symbol, trade.get("side"), qty_to_add)
+                
+                # State update
+                trade["dca_level"] = next_phase["level"]
+                old_cap = trade.get("capital", 0.0)
+                old_qty = trade.get("quantity", 0.0)
+                old_entry = trade.get("entry_price", 0.0)
+                
+                trade["capital"] = old_cap + capital_to_add
+                trade["quantity"] = old_qty + qty_to_add
+                
+                # Calculate new blended average entry price
+                trade["entry_price"] = ((old_entry * old_qty) + (current * qty_to_add)) / trade["quantity"]
+                
+                # ── Widen the Physical Exchange SL ──────────────────────────
+                if is_live:
+                    try:
+                        dca_safety_pct = 65.0
+                        price_move = (dca_safety_pct / 100.0) / lev
+                        # tradebook stores side as 'position' ('LONG'/'SHORT') 
+                        is_long = trade.get("position", trade.get("side")) == "LONG"
+                        new_cat_sl = trade["entry_price"] * (1.0 - price_move) if is_long else trade["entry_price"] * (1.0 + price_move)
+                        
+                        from execution_engine import ExecutionEngine
+                        ExecutionEngine.modify_sl_live(symbol, new_cat_sl)
+                        logger.info("🛡️ DCA Physical SL widened natively to %.6f to perfectly match new blended entry.", new_cat_sl)
+                    except Exception as sl_err:
+                        logger.error("❌ Failed to widen physical SL on DCA for %s: %s", symbol, sl_err)
+
+                logger.info(
+                    "📉 DCA %s hit for %s (pnl %.2f%% <= %.2f%%). Added $%.1f. New avg entry: %.6f",
+                    next_phase["name"], symbol, pnl_pct, next_phase["trigger_pnl_pct"], capital_to_add, trade["entry_price"]
+                )
+                return  # Skip SL check on the cycle we averaged down to allow PnL to recalculate naturally on next heartbeat
+            except Exception as dca_err:
+                logger.error("❌ Failed DCA execution for %s: %s", symbol, dca_err)
+
+    # ── CATASTROPHIC STOP LOSS (Blended) ──────────────────────────
+    max_loss_limit = getattr(config, "DCA_HARD_STOP_PCT", -60.0)
     if pnl_pct <= max_loss_limit:
         logger.warning(
-            "🛑 MAX LOSS hit on %s (%.2f%% <= %.0f%%) — auto-closing trade %s",
+            "🛑 CATASTROPHIC LOSS hit on %s (%.2f%% <= %.0f%%) — auto-closing trade %s",
             symbol, pnl_pct, max_loss_limit, trade["trade_id"],
         )
         if is_live:
             from execution_engine import ExecutionEngine
             ExecutionEngine.close_position_live(symbol)
-        _close_trade_inline(trade, current, f"MAX_LOSS_{int(max_loss_limit)}%")
+        _close_trade_inline(trade, current, f"DCA_MAX_LOSS_{int(max_loss_limit)}%")
         return
+
+    # HARD MAX PROFIT GUARD — symmetric to MAX LOSS
+    # Simple flat exit: close when PnL% hits the profit ceiling.
+    # Trailing SL steps still run first (lock profit at +15%/+25%),
+    # this fires as the absolute ceiling to bank the gain.
+    max_profit_limit = getattr(config, "MAX_PROFIT_PER_TRADE_PCT", None)
+    if max_profit_limit and pnl_pct >= max_profit_limit:
+        logger.info(
+            "🎯 MAX PROFIT hit on %s (%.2f%% >= %.0f%%) — auto-closing trade %s",
+            symbol, pnl_pct, max_profit_limit, trade["trade_id"],
+        )
+        if is_live:
+            from execution_engine import ExecutionEngine
+            ExecutionEngine.close_position_live(symbol)
+        _close_trade_inline(trade, current, f"MAX_PROFIT_{int(max_profit_limit)}%")
+        return
+
+    # ── FIX-D1: TRADE DURATION CAP (Stall Exit) ──────────────────────────────
+    # If a trade is STUCK (small PnL, going nowhere) after TRADE_MAX_AGE_HOURS,
+    # close it to free capital for better opportunities.
+    # Condition: age >= max AND |pnl_pct| <= stuck threshold (not a winner/loser).
+    _max_age_hours = getattr(config, "TRADE_MAX_AGE_HOURS", None)
+    _stuck_pnl_pct = getattr(config, "TRADE_STUCK_PNL_PCT", 5.0)
+    if _max_age_hours and should_auto_close:
+        try:
+            _entry_time = datetime.fromisoformat(trade["entry_timestamp"])
+            if _entry_time.tzinfo is None:
+                _entry_time = _entry_time.replace(tzinfo=timezone.utc)
+            _age_hours = (datetime.now(timezone.utc) - _entry_time).total_seconds() / 3600
+            _is_stuck = abs(pnl_pct) <= _stuck_pnl_pct
+            if _age_hours >= _max_age_hours and _is_stuck:
+                logger.info(
+                    "⏰ STALL EXIT on %s — age=%.1fh >= %.0fh cap, PnL=%.2f%% within ±%.0f%% stuck band",
+                    symbol, _age_hours, _max_age_hours, pnl_pct, _stuck_pnl_pct,
+                )
+                if is_live:
+                    from execution_engine import ExecutionEngine
+                    ExecutionEngine.close_position_live(symbol)
+                _close_trade_inline(trade, current, f"STALL_EXIT_{_max_age_hours}H")
+                return
+        except Exception as _te:
+            logger.debug("Stall exit age check failed for %s: %s", symbol, _te)
 
     # ── PARTIAL PROFIT BOOKING (T1, T2, T3) ──────────────────────────────────
     # Replaces the old MAX_PROFIT_PER_TRADE_PCT hard close.
@@ -900,62 +1109,78 @@ def _update_single_trade(trade, book, prices, funding_rates):
                     _close_trade_inline(trade, current, name)
                     return  # Trade fully closed
 
-    # Use trailing values for SL hit checks
-    # (paper mode override: always auto-close when config.PAPER_TRADE=True)
-    if should_auto_close:
-        effective_sl = trade.get("trailing_sl", trade["stop_loss"])
-
-        sl_hit = False
+    # ── SL SAFETY NET (Paper & Live) ─────────────────────
+    # For LIVE trades, the exchange manages the SL limit order natively.
+    # However, wicks, exchange downtime, or tracking bugs can cause SL to be breached
+    # without local sync. The engine acts as the ultimate safety net.
+    effective_sl = trade.get("trailing_sl", trade["stop_loss"])
+    sl_hit = False
+    
+    if effective_sl > 0:
         if is_long:
             sl_hit = current <= effective_sl
         else:
             sl_hit = current >= effective_sl
 
-        if sl_hit:
-            sl_n = trade.get("trail_sl_count", 0)
-            step_level = trade.get("stepped_lock_level", -1)
-            # Determine SL reason based on target state
-            b_level = trade.get("booking_level", -1)
-            steps_conf = getattr(config, 'PARTIAL_BOOKING_STEPS', [])
-            
-            if b_level >= 0 and b_level < len(steps_conf):
-                _, _, name = steps_conf[b_level]
-                reason = f"SL_AFTER_{name}"
-            elif trade.get("t2_hit"):
-                reason = "SL_T2"  # Legacy T2
-            elif trade.get("t1_hit"):
-                reason = "SL_T1"  # Legacy T1
-            elif trade["trailing_active"] and step_level >= 0:
-                # Stepped lock was active — show which level
-                steps = getattr(config, 'TRAILING_SL_STEPS', [])
-                if step_level < len(steps):
-                    _, lock_pnl = steps[step_level]
-                    if lock_pnl == 0:
-                        lock_tag = " (BEV)"
-                    else:
-                        lock_tag = f" (+{lock_pnl:.0f}% Locked)"
-                else:
-                    lock_tag = ""
-                reason = f"STEPPED_SL_{sl_n}{lock_tag}"
+    if sl_hit:
+        sl_n = trade.get("trail_sl_count", 0)
+        step_level = trade.get("stepped_lock_level", -1)
+        b_level = trade.get("booking_level", -1)
+        steps_conf = getattr(config, 'PARTIAL_BOOKING_STEPS', [])
+        
+        if b_level >= 0 and b_level < len(steps_conf):
+            _, _, name = steps_conf[b_level]
+            reason = f"SL_AFTER_{name}"
+        elif trade.get("t2_hit"):
+            reason = "SL_T2"
+        elif trade.get("t1_hit"):
+            reason = "SL_T1"
+        elif trade["trailing_active"] and step_level >= 0:
+            steps = getattr(config, 'TRAILING_SL_STEPS', [])
+            if step_level < len(steps):
+                _, lock_pnl = steps[step_level]
+                lock_tag = " (BEV)" if lock_pnl == 0 else f" (+{lock_pnl:.0f}% Locked)"
             else:
-                reason = "FIXED_SL"
-            _close_trade_inline(trade, current, reason)
-            return  # trade closed — stop processing this trade
+                lock_tag = ""
+            reason = f"STEPPED_SL_{sl_n}{lock_tag}"
+        else:
+            reason = "FIXED_SL"
 
-        # Old TP hit (only when partial booking is NOT active for this trade)
-        if hasattr(config, "PARTIAL_BOOKING_STEPS") and not config.PARTIAL_BOOKING_STEPS:
-            effective_tp = trade.get("trailing_tp", trade.get("take_profit", 0))
-            if effective_tp:
-                tp_hit = False
-                if is_long:
-                    tp_hit = current >= effective_tp
-                else:
-                    tp_hit = current <= effective_tp
-                if tp_hit:
-                    ext = trade["tp_extensions"]
-                    reason = f"TP_EXT_{ext}" if ext > 0 else "FIXED_TP"
-                    _close_trade_inline(trade, current, reason)
-                    return
+        if is_live:
+            logger.warning("🚨 SL SAFETY NET triggered for %s at %.6f (Reason: %s). Forcing close via ExecutionEngine.", symbol, current, reason)
+            try:
+                from execution_engine import ExecutionEngine
+                ExecutionEngine.close_position_live(symbol)
+            except Exception as e:
+                logger.error("Failed safety net live close: %s", e)
+
+        _close_trade_inline(trade, current, reason)
+        return  # trade closed — stop processing this trade
+
+    # Old TP hit safety net
+    if hasattr(config, "PARTIAL_BOOKING_STEPS") and not config.PARTIAL_BOOKING_STEPS:
+        effective_tp = trade.get("trailing_tp", trade.get("take_profit", 0))
+        if effective_tp:
+            tp_hit = False
+            if is_long:
+                tp_hit = current >= effective_tp
+            else:
+                tp_hit = current <= effective_tp
+            if tp_hit:
+                ext = trade["tp_extensions"]
+                reason = f"TP_EXT_{ext}" if ext > 0 else "FIXED_TP"
+                if is_live:
+                    try:
+                        from execution_engine import ExecutionEngine
+                        ExecutionEngine.close_position_live(symbol)
+                    except Exception as e:
+                        try:
+                            logger.debug('Exception caught: %s', e, exc_info=True)
+                        except NameError:
+                            pass
+                        pass
+                _close_trade_inline(trade, current, reason)
+                return
 
     # ── TP OVERSHOOT SAFETY NET ──────────────────────────────────────
     # Fires when price GAPS THROUGH the TP level between heartbeats.
@@ -992,9 +1217,36 @@ def get_tradebook():
 
 
 def get_active_trades():
-    """Return only active trades."""
+    """Return only active trades, securely isolated to the current engine mode."""
+    import config
     book = _load_book()
-    return [t for t in book["trades"] if t["status"] in ("ACTIVE", "OPEN")]
+    
+    expected_mode = "paper" if getattr(config, "PAPER_TRADE", True) else "live"
+    active_trades = []
+    
+    for t in book.get("trades", []):
+        if t.get("status") in ("ACTIVE", "OPEN"):
+            # Strong isolation: NEVER return a paper trade if engine is LIVE (and vice versa)
+            t_mode = (t.get("mode") or "paper").lower()
+            if t_mode.startswith(expected_mode):
+                active_trades.append(t)
+                
+    return active_trades
+
+
+def get_all_active_trades():
+    """Return ALL active trades regardless of engine mode.
+
+    Use this when you need to count trades per specific bot_id across both
+    paper and live modes — e.g. the per-bot trade cap check in strategy_runner.
+    get_active_trades() is mode-gated by config.PAPER_TRADE and will miss
+    trades from the 'other' mode when bots have per-bot mode settings.
+    """
+    book = _load_book()
+    return [
+        t for t in book.get("trades", [])
+        if t.get("status") in ("ACTIVE", "OPEN")
+    ]
 
 
 def get_closed_trades():
@@ -1076,11 +1328,17 @@ def sync_live_tpsl():
     book = _load_book()
     updated_count = 0
 
+    try:
+        physical_positions = cdx.list_positions()
+    except Exception as fetch_err:
+        logger.error("Watchdog failed to fetch physical positions: %s", fetch_err)
+        return
+
     for trade in book["trades"]:
         if trade["status"] != "ACTIVE":
-            continue   # BUG FIX: was `return` — exited entire loop on first non-active trade
-        if trade.get("mode") != "LIVE":
-            continue   # BUG FIX: was `return` — exited entire loop on first non-live trade
+            continue   
+        if str(trade.get("mode", "PAPER")).upper() != "LIVE":
+            continue   
 
         symbol = trade["symbol"]
         trailing_sl = trade.get("trailing_sl", trade["stop_loss"])
@@ -1090,29 +1348,43 @@ def sync_live_tpsl():
         last_sl = trade.get("_cdx_last_sl")
         last_tp = trade.get("_cdx_last_tp")
 
-        # Force initial push if never synced to CoinDCX
-        first_push = (last_sl is None or last_tp is None)
-
-        if not first_push:
-            sl_changed = abs(trailing_sl - last_sl) > 1e-8
-            tp_changed = abs(trailing_tp - last_tp) > 1e-8
-            if not sl_changed and not tp_changed:
-                continue
-
-        # Find CoinDCX position ID
+        # 1. Match Trade to Physical Pos
         pair = cdx.to_coindcx_pair(symbol)
+        pos_id = None
+        phys_sl = None
+        phys_tp = None
+        
+        for p in physical_positions:
+            if p.get("pair") == pair and float(p.get("active_pos", 0)) != 0:
+                pos_id = p["id"]
+                phys_sl = p.get("stop_loss_trigger")
+                phys_tp = p.get("take_profit_trigger")
+                break
+
+        if not pos_id:
+            logger.info("❌ Ghost trade detected for %s (missing on physical exchange). Shutting down local engine memory.", symbol)
+            exit_p = cdx.get_current_price(pair)
+            if not exit_p:
+                exit_p = trade["entry_price"]
+            _close_trade_inline(trade, exit_p, "EXCHANGE_CLOSED")
+            updated_count += 1
+            continue
+
+        # 2. Watchdog: Are physical TPSL bounds entirely missing externally?
+        missing_physical_limits = False
+        if phys_sl is None or phys_tp is None:
+            logger.warning("🛡️ WATCHDOG ACTIVE: %s is missing physical TP/SL limits on exchange! Forcing recreation.", symbol)
+            missing_physical_limits = True
+
+        # 3. Check Local Caching Drift
+        first_push = (last_sl is None or last_tp is None)
+        sl_changed = abs(trailing_sl - (last_sl or 0)) > 1e-8
+        tp_changed = abs(trailing_tp - (last_tp or 0)) > 1e-8
+
+        if not missing_physical_limits and not first_push and not sl_changed and not tp_changed:
+            continue
+
         try:
-            positions = cdx.list_positions()
-            pos_id = None
-            for p in positions:
-                if p.get("pair") == pair and float(p.get("active_pos", 0)) != 0:
-                    pos_id = p["id"]
-                    break
-
-            if not pos_id:
-                logger.debug("No CoinDCX position for %s — skip TPSL sync", symbol)
-                continue
-
             # Round to CoinDCX tick sizes
             rounded_sl = _price_round(trailing_sl)
             rounded_tp = _price_round(trailing_tp)
@@ -1130,7 +1402,7 @@ def sync_live_tpsl():
 
             logger.info(
                 "🔄 TPSL updated on CoinDCX for %s: SL=$%.6f → $%.6f | TP=$%.6f → $%.6f",
-                symbol, last_sl, rounded_sl, last_tp, rounded_tp,
+                symbol, (last_sl or 0), rounded_sl, (last_tp or 0), rounded_tp,
             )
 
         except Exception as e:

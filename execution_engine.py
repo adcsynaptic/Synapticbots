@@ -53,9 +53,10 @@ class ExecutionEngine:
     Paper mode routes to Binance (testnet, simulated).
     """
 
-    def __init__(self, client=None):
+    def __init__(self, client=None, engine=None):
         self._client = client  # Binance client (paper only)
-        self.risk = RiskManager()
+        self.engine = engine
+        self.risk = RiskManager(engine=engine)
 
     def _get_binance_client(self):
         """Lazy-init Binance client (paper mode only)."""
@@ -89,7 +90,8 @@ class ExecutionEngine:
 
     def execute_trade(self, symbol, side, leverage, quantity, atr,
                       regime=None, confidence=None, reason="", swing_l=None, swing_h=None,
-                      fallback_leverage=None):
+                      fallback_leverage=None, stop_loss=None, take_profit=None,
+                      paper_override=None):
         """
         Execute a futures trade with protective SL/TP.
 
@@ -118,8 +120,14 @@ class ExecutionEngine:
 
         regime_name = config.REGIME_NAMES.get(regime, "UNKNOWN")
 
+        # Determine effective paper/live mode for THIS trade.
+        # paper_override=None  → respect global PAPER_TRADE (legacy behaviour)
+        # paper_override=True  → force paper simulation (bot DB mode = 'paper')
+        # paper_override=False → force live exchange  (bot DB mode = 'live')
+        is_paper = config.PAPER_TRADE if paper_override is None else bool(paper_override)
+
         # ── Paper Trade Mode ────────────────────────────────────────
-        if config.PAPER_TRADE:
+        if is_paper:
             # Use Binance WebSocket price (sub-100ms) — falls back to REST if WS not ready yet
             try:
                 from price_stream import get_price_stream
@@ -147,7 +155,9 @@ class ExecutionEngine:
                     current_price = round(current_price * (1 - slip), 6)  # SELL fills slightly lower
                 logger.debug("📡 PAPER slippage applied %s: %.4f%% → %.6f", symbol, slip * 100, current_price)
 
-            sl, tp, rm_id = self.risk.calculate_optimal_stops(symbol, current_price, atr, side, leverage, swing_l, swing_h)
+            sl = stop_loss
+            tp = take_profit
+            rm_id = "external"
             log_entry = {
                 "timestamp":   datetime.utcnow().isoformat(),
                 "symbol":      symbol,
@@ -175,14 +185,14 @@ class ExecutionEngine:
         exchange = getattr(config, 'EXCHANGE_LIVE', '').lower()
         if exchange == 'binance':
             return self._execute_binance_live(symbol, side, leverage, quantity, atr,
-                                              regime, regime_name, confidence, reason, swing_l, swing_h)
+                                              regime, regime_name, confidence, reason, swing_l, swing_h, stop_loss, take_profit)
         # Default to CoinDCX
         return self._execute_coindcx(symbol, side, leverage, quantity, atr,
                                      regime, regime_name, confidence, reason, swing_l, swing_h,
-                                     fallback_leverage)
+                                     fallback_leverage, stop_loss, take_profit)
 
     def _execute_binance_live(self, symbol, side, leverage, quantity, atr,
-                               regime, regime_name, confidence, reason, swing_l=None, swing_h=None):
+                               regime, regime_name, confidence, reason, swing_l=None, swing_h=None, stop_loss=None, take_profit=None):
         """Execute a live trade on Binance Futures."""
         client = get_exchange_client()
         if not client:
@@ -196,7 +206,9 @@ class ExecutionEngine:
         max_slippage = getattr(config, 'MAX_SLIPPAGE_PCT', 0.5) / 100.0
         limit_price = current_price * (1 + max_slippage) if side.upper() == 'BUY' else current_price * (1 - max_slippage)
         
-        sl, tp, rm_id = self.risk.calculate_optimal_stops(symbol, current_price, atr, side, leverage, swing_l, swing_h)
+        sl = stop_loss
+        tp = take_profit
+        rm_id = "external"
 
         result = client.open_position(
             symbol=symbol, side=side, quantity=quantity,
@@ -268,6 +280,37 @@ class ExecutionEngine:
             logger.warning("No exchange client — cannot close %s", symbol)
             return False
         return client.close_position(symbol)
+
+    @staticmethod
+    def add_to_position_live(symbol, side, quantity):
+        """Add to a live position (for DCA averaging down)."""
+        client = get_exchange_client()
+        if not client:
+            logger.warning("No exchange client — cannot add to %s", symbol)
+            return None
+            
+        exchange = getattr(config, 'EXCHANGE_LIVE', '').lower()
+        try:
+            if exchange == 'coindcx':
+                import coindcx_client as cdx
+                from coindcx_exchange_client import CoinDCXExchangeClient
+                pair = cdx.to_coindcx_pair(symbol)
+                step = CoinDCXExchangeClient._qty_step(cdx.get_current_price(pair) or 1)
+                quantity = CoinDCXExchangeClient._round_to_step(quantity, step)
+                return client.create_order(
+                    pair=pair, side=side.lower(), order_type="market_order",
+                    quantity=quantity, leverage=None, price=None,
+                    take_profit_price=None, stop_loss_price=None
+                )
+            elif exchange == 'binance':
+                return client.open_position(
+                    symbol=symbol, side=side, quantity=quantity,
+                    leverage=None, sl_price=None, tp_price=None,
+                    order_type="MARKET"
+                )
+        except Exception as e:
+            logger.error("Failed to add to position live for %s: %s", symbol, e)
+            return None
     # ─── CoinDCX helpers ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -415,7 +458,7 @@ class ExecutionEngine:
 
     def _execute_coindcx(self, symbol, side, leverage, quantity, atr,
                          regime, regime_name, confidence, reason, swing_l=None, swing_h=None,
-                         fallback_leverage=None):
+                         fallback_leverage=None, stop_loss=None, take_profit=None):
         """Execute a live trade on CoinDCX Futures. Returns a trade log dict or None."""
         import coindcx_client as cdx
 
@@ -426,7 +469,9 @@ class ExecutionEngine:
                 return None
             price, quantity, leverage, wallet = validated
 
-            sl, tp, rm_id = self.risk.calculate_optimal_stops(symbol, price, atr, side, leverage, swing_l, swing_h)
+            sl = stop_loss
+            tp = take_profit
+            rm_id = "external"
             sl = self._cdx_price_round(sl)
             tp = self._cdx_price_round(tp)
 

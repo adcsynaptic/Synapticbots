@@ -34,7 +34,7 @@ export function OverviewScreen() {
   const coinStates = engine.data?.multi?.coin_states ?? EMPTY_COIN_STATES;
   const segQ = useQuery({ queryKey: ['segments'], queryFn: mobileApi.marketSegments, refetchInterval: 30000 });
   const perBot: Record<string, any> | undefined = engine.data?.perBot;
-  const recentTrades: any[] = engine.data?.tradebook?.trades || [];
+  const recentTrades: any[] = engine.data?.tradebookAllModes?.trades || engine.data?.tradebook?.trades || [];
   const multi = engine.data?.multi || {};
   const pendingSignals: any[] = Array.isArray(multi?.pending_signals_detail) ? multi.pending_signals_detail : [];
   const cockpitSignalQ: any[] = Array.isArray(cockpitQ.data?.signalQueue) ? cockpitQ.data.signalQueue : [];
@@ -558,12 +558,16 @@ export function OverviewScreen() {
                 const side = String(t.position || t.side || '').toUpperCase();
                 const isActive = String(t.status || '').toUpperCase() === 'ACTIVE';
                 const pnl = Number(isActive ? (t.activePnl || 0) : (t.totalPnl || 0));
+                const mode = String(t.engineMode || t.mode || '').toLowerCase();
                 return (
                   <View key={t.id} style={styles.predRow}>
                     <Text style={[styles.predSymbol, { color: colors.text }]}>{sym}</Text>
                     <Text style={[styles.predSide, { color: side === 'LONG' ? neon.emerald : neon.danger }]}>{side || '—'}</Text>
                     <Text style={[styles.predMeta, { color: colors.textSecondary }]} numberOfLines={1}>
-                      {isActive ? 'Active' : 'Closed'} · {formatUsd(pnl)}
+                      {isActive ? 'Active' : 'Closed'}
+                      {mode ? ` · ${mode.toUpperCase()}` : ''}
+                      {' · '}
+                      {formatUsd(pnl)}
                     </Text>
                   </View>
                 );

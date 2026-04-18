@@ -64,6 +64,40 @@ function shapeMobileEnginePayload(all: any) {
   };
 }
 
+function toMs(value: unknown): number {
+  if (value == null) return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const str = String(value);
+  const n = Date.parse(str);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function buildCombinedTradebook(
+  probes: Array<{ mode: 'live' | 'paper'; all: any }>
+): { trades: any[]; summary: { modes: string[]; count: number } } {
+  const trades = probes.flatMap(({ mode, all }) => {
+    const rows = Array.isArray(all?.tradebook?.trades) ? all.tradebook.trades : [];
+    return rows.map((t: any) => ({
+      ...t,
+      engineMode: mode,
+    }));
+  });
+
+  trades.sort((a, b) => {
+    const aTs = toMs(a.entryTime ?? a.entry_time ?? a.openedAt ?? a.opened_at ?? a.timestamp);
+    const bTs = toMs(b.entryTime ?? b.entry_time ?? b.openedAt ?? b.opened_at ?? b.timestamp);
+    return bTs - aTs;
+  });
+
+  return {
+    trades: trades.slice(0, 80),
+    summary: {
+      modes: Array.from(new Set(probes.map((p) => p.mode))),
+      count: trades.length,
+    },
+  };
+}
+
 /** When engine coin rows omit 24h % (MTF_INSUFFICIENT, vetoes, etc.), fill from public Binance ticker. */
 async function enrichCoinStates24h(coinStates: Record<string, any>): Promise<Record<string, any>> {
   const keys = Object.keys(coinStates);
@@ -154,6 +188,11 @@ export async function GET() {
 
     let shaped = shapeMobileEnginePayload(all);
     const enriched = await enrichCoinStates24h(shaped.multi?.coin_states || {});
+    const tradebookAllModes = buildCombinedTradebook(
+      probes
+        .filter((p) => !!p.all)
+        .map((p) => ({ mode: p.mode, all: p.all }))
+    );
     shaped = {
       ...shaped,
       multi: { ...shaped.multi, coin_states: enriched },
@@ -170,6 +209,7 @@ export async function GET() {
       engine: health,
       mode,
       ...shaped,
+      tradebookAllModes,
       snapshot: {
         cycle: multi?.cycle || 0,
         coinsScanned: Object.keys(coinStates).length,

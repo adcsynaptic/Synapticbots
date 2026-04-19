@@ -9,8 +9,10 @@ import { useThemeTokens } from '../theme/useThemeTokens';
 export function PositionsScreen() {
   const { colors, glassBg, glassBorder, neon } = useThemeTokens();
   const { data, isLoading, error } = useQuery({ queryKey: ['positions'], queryFn: mobileApi.positions, refetchInterval: 15000 });
+  const closedPaperQ = useQuery({ queryKey: ['closed-paper-trades'], queryFn: mobileApi.closedPaperTrades, refetchInterval: 15000 });
   const positions = sortPositionsByPnl(data?.positions || []);
   const totalPnl = positions.reduce((sum: number, p: any) => sum + Number(p.pnl || 0), 0);
+  const closedPaperTrades = Array.isArray(closedPaperQ.data?.trades) ? closedPaperQ.data.trades : [];
 
   return (
     <Screen title="Paper Trade" safeTop={false}>
@@ -51,6 +53,39 @@ export function PositionsScreen() {
           </Text>
         </View>
       ))}
+
+      <View style={[styles.closedSection, { backgroundColor: glassBg, borderColor: glassBorder }]}>
+        <Text style={[styles.closedTitle, { color: colors.text }]}>Past Closed Paper Trades</Text>
+        {closedPaperQ.isLoading ? (
+          <Text style={{ color: colors.textSecondary }}>Loading closed paper trades...</Text>
+        ) : closedPaperTrades.length === 0 ? (
+          <Text style={{ color: colors.textSecondary }}>No closed paper trades yet.</Text>
+        ) : (
+          closedPaperTrades.map((t: any, i: number) => {
+            const sym = String(t.symbol || t.coin || '').toUpperCase();
+            const side = String(t.position || t.side || '').toUpperCase();
+            const pnl = Number(t.totalPnl ?? t.realizedPnl ?? t.pnl ?? 0);
+            const status = String(t.status || 'CLOSED').toUpperCase();
+            const mode = String(t.engineMode || t.mode || '').toUpperCase();
+            const key = `closed-${String(t.id ?? i)}-${sym}-${side}-${status}`;
+            return (
+              <View key={key} style={styles.closedRow}>
+                <Text style={[styles.closedSymbol, { color: colors.text }]}>{sym || '—'}</Text>
+                <Text style={[styles.closedSide, { color: side === 'LONG' ? neon.emerald : neon.danger }]}>
+                  {side || '—'}
+                </Text>
+                <Text style={[styles.closedMeta, { color: colors.textSecondary }]} numberOfLines={1}>
+                  {status}
+                  {mode ? ` · ${mode}` : ''}
+                </Text>
+                <Text style={[styles.closedPnl, { color: pnl >= 0 ? neon.emerald : neon.danger }]}>
+                  {formatUsd(pnl)}
+                </Text>
+              </View>
+            );
+          })
+        )}
+      </View>
     </Screen>
   );
 }
@@ -67,4 +102,19 @@ const styles = StyleSheet.create({
   meta: { fontSize: 12, fontWeight: '600' },
   pnl: { fontSize: 14, fontWeight: '800', marginTop: 4 },
   emptyCard: { borderWidth: 1, borderRadius: 14, padding: 14 },
+  closedSection: { borderWidth: 1, borderRadius: 14, padding: 14, marginTop: 4, gap: 8 },
+  closedTitle: { fontSize: 14, fontWeight: '800' },
+  closedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8 as any,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    backgroundColor: 'rgba(255,255,255,0.02)',
+  },
+  closedSymbol: { fontSize: 12, fontWeight: '800', width: 76 },
+  closedSide: { fontSize: 11, fontWeight: '800', width: 54, textAlign: 'right' },
+  closedMeta: { fontSize: 10, fontWeight: '600', flex: 1 },
+  closedPnl: { fontSize: 12, fontWeight: '800', width: 88, textAlign: 'right' },
 });

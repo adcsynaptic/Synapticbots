@@ -88,6 +88,7 @@ export const mobileApi = {
   me: () => request<{ user: { id: string; email: string; name: string | null; role: string | null } }>('/api/mobile/v1/auth/me'),
   overview: () => request<any>('/api/mobile/v1/dashboard/overview'),
   positions: () => request<any>('/api/mobile/v1/dashboard/positions'),
+  closedPaperTrades: () => request<{ trades: any[] }>('/api/mobile/v1/dashboard/closed-paper-trades'),
   performance: () => request<any>('/api/mobile/v1/dashboard/performance'),
   market: () => request<any>('/api/mobile/v1/market/live'),
   marketCandles: (symbol: string, interval: string, limit: number) =>

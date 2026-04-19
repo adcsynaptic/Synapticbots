@@ -54,8 +54,21 @@ export function OverviewScreen() {
   const [editMaxTrades, setEditMaxTrades] = React.useState(10);
   const [editCapitalPerTrade, setEditCapitalPerTrade] = React.useState(100);
   const [savingEdit, setSavingEdit] = React.useState(false);
+  const [expandedBotTrades, setExpandedBotTrades] = React.useState<Record<string, boolean>>({});
 
   const sortedCoinRows = React.useMemo(() => buildSortedCoinRows(coinStates as Record<string, any>), [coinStates]);
+  const paperTradesByBot = React.useMemo(() => {
+    const grouped: Record<string, any[]> = {};
+    for (const t of recentTrades) {
+      const mode = String(t?.engineMode || t?.mode || 'paper').toLowerCase();
+      if (mode !== 'paper') continue;
+      const botId = String(t?.botId || t?.bot_id || t?.engineId || t?.engine_id || '');
+      if (!botId) continue;
+      if (!grouped[botId]) grouped[botId] = [];
+      grouped[botId].push(t);
+    }
+    return grouped;
+  }, [recentTrades]);
 
   function colorForDelta(delta: number) {
     const d = Math.max(-15, Math.min(15, Number.isFinite(delta) ? delta : 0));
@@ -209,6 +222,10 @@ export function OverviewScreen() {
     } finally {
       setSavingEdit(false);
     }
+  }
+
+  function toggleBotTrades(botId: string) {
+    setExpandedBotTrades((prev) => ({ ...prev, [botId]: !prev[botId] }));
   }
 
   return (
@@ -420,8 +437,8 @@ export function OverviewScreen() {
             ) : positionsQ.error ? (
               <Text style={{ color: colors.danger }}>Failed to load positions</Text>
             ) : (
-              (positionsQ.data?.positions || []).slice(0, 5).map((p: any) => (
-                <View key={p.id} style={styles.predRow}>
+              (positionsQ.data?.positions || []).slice(0, 5).map((p: any, i: number) => (
+                <View key={String(p.id ?? `pos-${i}`)} style={styles.predRow}>
                   <Text style={[styles.predSymbol, { color: colors.text }]}>{String(p.symbol || '').toUpperCase()}</Text>
                   <Text style={[styles.predSide, { color: (String(p.side || '').toUpperCase() === 'LONG') ? neon.emerald : neon.danger }]}>
                     {String(p.side || '').toUpperCase()}
@@ -494,6 +511,17 @@ export function OverviewScreen() {
                       <Text style={{ color: colors.text, fontWeight: '700', fontSize: 11 }}>Edit</Text>
                     </Pressable>
                     <Pressable
+                      onPress={() => toggleBotTrades(b.id)}
+                      style={({ pressed }) => [
+                        styles.botActionBtn,
+                        { borderColor: glassBorder, opacity: pressed || busyBotId === b.id ? 0.8 : 1 },
+                      ]}
+                    >
+                      <Text style={{ color: neon.cyan, fontWeight: '700', fontSize: 11 }}>
+                        {expandedBotTrades[b.id] ? 'Hide Trades' : `Paper Trades (${(paperTradesByBot[b.id] || []).length})`}
+                      </Text>
+                    </Pressable>
+                    <Pressable
                       onPress={() => handleDeleteBot(b.id)}
                       style={({ pressed }) => [
                         styles.botActionBtn,
@@ -503,6 +531,41 @@ export function OverviewScreen() {
                       <Text style={{ color: colors.danger, fontWeight: '700', fontSize: 11 }}>Delete</Text>
                     </Pressable>
                   </View>
+                  {expandedBotTrades[b.id] ? (
+                    <View style={[styles.botTradesPanel, { borderColor: glassBorder }]}>
+                      {(paperTradesByBot[b.id] || []).length === 0 ? (
+                        <Text style={[styles.botTradesEmpty, { color: colors.textSecondary }]}>No paper trades.</Text>
+                      ) : (
+                        (paperTradesByBot[b.id] || []).map((t: any, i: number) => {
+                          const side = String(t.position || t.side || '').toUpperCase();
+                          const sym = String(t.symbol || t.coin || '').toUpperCase();
+                          const status = String(t.status || 'UNKNOWN').toUpperCase();
+                          const isActive = status === 'ACTIVE';
+                          const pnl = Number(t.activePnl ?? t.unrealizedPnl ?? t.pnl ?? 0);
+                          const sideLong = side === 'LONG' || side === 'BUY';
+                          return (
+                            <View key={`${b.id}-trade-${String(t.id || i)}`} style={styles.botTradeRow}>
+                              <Text style={[styles.botTradeSym, { color: colors.text }]}>{sym || '—'}</Text>
+                              <Text style={[styles.botTradeSide, { color: sideLong ? neon.emerald : neon.danger }]}>
+                                {side || '—'}
+                              </Text>
+                              <Text style={[styles.botTradeStatus, { color: isActive ? neon.cyan : colors.textSecondary }]}>
+                                {isActive ? 'OPEN' : status}
+                              </Text>
+                              <Text
+                                style={[
+                                  styles.botTradePnl,
+                                  { color: pnl >= 0 ? neon.emerald : neon.danger },
+                                ]}
+                              >
+                                {formatUsd(pnl)}
+                              </Text>
+                            </View>
+                          );
+                        })
+                      )}
+                    </View>
+                  ) : null}
                 </View>
               ))
             )}
@@ -553,14 +616,15 @@ export function OverviewScreen() {
           {recentTrades.length ? (
             <View style={[styles.engineCard, { backgroundColor: glassBg, borderColor: glassBorder }]}>
               <Text style={[styles.sectionTitle, { color: colors.text }]}>Recent Trades</Text>
-              {recentTrades.slice(0, 6).map((t: any) => {
+              {recentTrades.slice(0, 6).map((t: any, i: number) => {
                 const sym = String(t.symbol || t.coin || '').toUpperCase();
                 const side = String(t.position || t.side || '').toUpperCase();
                 const isActive = String(t.status || '').toUpperCase() === 'ACTIVE';
                 const pnl = Number(isActive ? (t.activePnl || 0) : (t.totalPnl || 0));
                 const mode = String(t.engineMode || t.mode || '').toLowerCase();
+                const key = `rt-${mode || 'na'}-${String(t.id ?? '')}-${sym}-${side}-${i}`;
                 return (
-                  <View key={t.id} style={styles.predRow}>
+                  <View key={key} style={styles.predRow}>
                     <Text style={[styles.predSymbol, { color: colors.text }]}>{sym}</Text>
                     <Text style={[styles.predSide, { color: side === 'LONG' ? neon.emerald : neon.danger }]}>{side || '—'}</Text>
                     <Text style={[styles.predMeta, { color: colors.textSecondary }]} numberOfLines={1}>
@@ -836,6 +900,27 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     backgroundColor: 'rgba(255,255,255,0.02)',
   },
+  botTradesPanel: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    gap: 6,
+    backgroundColor: 'rgba(255,255,255,0.02)',
+  },
+  botTradesEmpty: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  botTradeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8 as any,
+  },
+  botTradeSym: { fontSize: 12, fontWeight: '800', width: 72 },
+  botTradeSide: { fontSize: 11, fontWeight: '800', width: 54, textAlign: 'right' },
+  botTradeStatus: { fontSize: 10, fontWeight: '700', width: 58, textAlign: 'right' },
+  botTradePnl: { fontSize: 12, fontWeight: '800', flex: 1, textAlign: 'right' },
 
   // Heatmap
   heatGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 as any, marginTop: 6 },
